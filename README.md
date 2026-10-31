@@ -27,12 +27,16 @@ bindings and saved data. The user-facing plugin name is MarginPop.
   directly; turn it off to restore the normal menu.
 - Tap an existing annotation to open a compact action bar at the bottom of the
   screen with its content and **Delete**, **Edit**, **Move**, and **Cancel**.
-  Long-press opens the editor directly. **Save & Move** also arms a one-shot
+  The bar spans the screen width, preserves line breaks, and stays within half
+  the screen height. It does not scroll; long previews are shortened with an
+  ellipsis, while the full note remains available in the editor. Long-press
+  opens the editor directly. **Save & Move** also arms a one-shot
   move: tap the new location to relocate it. The selected emoji is
   contrast-inverted while the move is pending.
 - Editors support multiline notes and scrolling. **Fullscreen Annotation
   Editor** toggles the layout from the MarginPop menu or from inside the
-  editor. Compact mode is the default; the preference is global.
+  editor. Compact mode is the default and provides three visible lines in the
+  editing area; the preference is global.
 - The note editor provides inline quick emoji rows, plus the full paged
   OpenMoji picker. The selected face is previewed by name and artwork. Recent
   and favorite rows do not repeat the same face. In the picker, long-press a
@@ -86,23 +90,29 @@ legacy-marker indexing runs in small background batches rather than blocking
 the reader; the first results include sidecar and visible-page annotations,
 and the list can be reopened after indexing finishes. Results are left-aligned
 and can be selected individually or in bulk. Long-press a result to filter by
-its emoji.
-Results can be selected individually or in bulk, opened at their anchor, or
-exported as Markdown.
+its emoji. Selected results can be edited or exported as Markdown.
 
 Export supports one combined Markdown file or separate files. The path field
 starts at `<KOReader folder>/popupExport`; enter an absolute folder path.
 The target folder is created if its parent exists, and existing files are not
-overwritten. The export dialog has global include/omit controls for book,
-chapter, and page metadata. Exported page numbers use that book's saved page
-offset. Emoji metadata includes the readable name, OpenMoji code, and a
-`#tag`.
+overwritten. Selected-annotation exports have global include/omit controls for
+book, chapter, and page metadata. History exports have a separate **History
+Export Fields** settings page for Book, Chapter, Source, Page, Emoji, Emoji
+code, Tags, and Timestamp. Source and Emoji are omitted by default; the other
+fields are included by default. Each toggle saves and refreshes immediately.
+The selected-annotation export controls also refresh immediately when toggled.
+Exported page numbers use that book's saved page offset. Timestamp metadata is
+formatted as `YYYY-MM-DD HH:MM:SS`.
 
 **Export All History Annotations** can split Markdown files by book, by book
 and chapter, or into one file per annotation. It reads MarginPop sidecar
 annotations from KOReader's reading history and includes legacy PDF marker
 entries when their lightweight marker index is already cached; it does not
-open every historical PDF to scan uncached legacy markers.
+open every historical PDF to scan uncached legacy markers. Grouped filenames
+use `YYMMDD-book.md` or `YYMMDD-book-chapter.md`; per-annotation filenames use
+the annotation's `YYMMDDhhmmss` creation time. Older sidecar annotations use
+the timestamp in their ID. Legacy PDF markers without a creation time use the
+export time for the filename.
 
 ## PDF embedding
 

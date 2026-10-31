@@ -10,6 +10,8 @@ local InputDialog = require("ui/widget/inputdialog")
 local Notification = require("ui/widget/notification")
 local RenderText = require("ui/rendertext")
 local RenderImage = require("ui/renderimage")
+local TextBoxWidget = require("ui/widget/textboxwidget")
+local Size = require("ui/size")
 local Screen = Device.screen
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -34,6 +36,7 @@ local PDF_NOTE_SERIAL_SETTING = "marginpop_pdf_note_serial_v1"
 local ANNOTATION_EDITOR_FULLSCREEN_SETTING = "marginpop_annotation_editor_fullscreen_v1"
 local CONTEXT_FORMATS_SETTING = "marginpop_context_formats_v1"
 local EXPORT_CONTEXT_SETTING = "marginpop_export_context_v1"
+local HISTORY_EXPORT_FIELDS_SETTING = "marginpop_history_export_fields_v1"
 local PDF_MARKER_INDEX_SETTING = "marginpop_pdf_marker_index_v1"
 local ANNOTATION_MARGIN_WIDTH_SETTING = "marginpop_annotation_margin_width_v1"
 local ANNOTATION_MARGIN_SIDE_SETTING = "marginpop_annotation_margin_side_v1"
@@ -55,6 +58,19 @@ local EMOJI_SIZE_SETTING = "marginpop_emoji_size"
 local PLUGIN_DIR = (debug.getinfo(1, "S").source or ""):match("@?(.*)/[^/]*$") or "."
 local KOREADER_DIR = PLUGIN_DIR:match("^(.*)/plugins/[^/]+$") or PLUGIN_DIR
 local DEFAULT_EXPORT_DIR = KOREADER_DIR .. "/popupExport"
+local HISTORY_EXPORT_FIELD_DEFAULTS = {
+    book = true,
+    chapter = true,
+    source = false,
+    page = true,
+    emoji = false,
+    emoji_code = true,
+    tags = true,
+    timestamp = true,
+}
+local HISTORY_EXPORT_FIELD_KEYS = {
+    "book", "chapter", "source", "page", "emoji", "emoji_code", "tags", "timestamp",
+}
 
 -- Keep the plugin loadable if an older installation has not copied the new
 -- artwork/catalog yet; the add-mode gesture must still work for plain dots.
@@ -363,6 +379,18 @@ function MarginPop:_loadGlobalPreferences()
         local value = type(export_context) == "table" and export_context[kind] or nil
         self.export_context[kind] = value == nil and true or value == true
     end
+    local history_fields = settings:readSetting(HISTORY_EXPORT_FIELDS_SETTING)
+    self.history_export_fields = {}
+    for _, kind in ipairs(HISTORY_EXPORT_FIELD_KEYS) do
+        local value
+        if type(history_fields) == "table" then
+            value = history_fields[kind]
+        end
+        if value == nil then
+            value = HISTORY_EXPORT_FIELD_DEFAULTS[kind]
+        end
+        self.history_export_fields[kind] = value == true
+    end
     self.annotate_selection_by_default =
         settings:readSetting(ANNOTATION_SELECTION_DEFAULT_SETTING) == true
 end
@@ -396,6 +424,10 @@ function MarginPop:init()
     self.pdf_marker_index_generation = 0
     self.context_formats = {}
     self.export_context = { book = true, chapter = true, page = true }
+    self.history_export_fields = {}
+    for _, kind in ipairs(HISTORY_EXPORT_FIELD_KEYS) do
+        self.history_export_fields[kind] = HISTORY_EXPORT_FIELD_DEFAULTS[kind]
+    end
     self.annotation_margin_width = DEFAULT_ANNOTATION_MARGIN_WIDTH
     self.annotation_margin_side = "right"
     self.annotation_emoji_position = "left"
@@ -1619,13 +1651,42 @@ function MarginPop:_showAnnotationActionMenu(annotation, index, marker)
     if body ~= "" then
         preview = preview ~= "" and (preview .. "\n" .. body) or body
     end
-    preview = util.fixUtf8(preview, "�"):gsub("[%c]+", " ")
+    preview = util.fixUtf8(preview, "�"):gsub("\r\n", "\n"):gsub("\r", "\n")
     if preview == "" then
         preview = item.emoji and emoji_label(item.emoji) or _("Empty annotation")
     end
-    preview = truncate_utf8(preview, 240)
-    local title = item.emoji
-        and (emoji_label(item.emoji) .. "\n" .. preview) or preview
+    local title = item.emoji and emoji_label(item.emoji) or _("Annotation")
+    local popup_width = Screen:getWidth()
+    local title_width = math.max(1, popup_width - 2 * (
+        Size.border.window + Size.padding.button
+            + Size.padding.default + Size.margin.default))
+    local preview_face = Font:getFace("infofont")
+    local max_content_height = math.max(Screen:scaleBySize(24),
+        math.floor(Screen:getHeight() / 2) - Screen:scaleBySize(140))
+    local popup_text = title .. "\n" .. preview
+    local function measure_popup_text(text)
+        return TextBoxWidget:new{
+            text = text,
+            face = preview_face,
+            width = title_width,
+            alignment = "left",
+        }:getSize().h
+    end
+    if measure_popup_text(popup_text) > max_content_height then
+        local characters = util.splitToChars(preview)
+        local low, high = 0, #characters
+        while low < high do
+            local middle = math.ceil((low + high) / 2)
+            local candidate = table.concat(characters, "", 1, middle) .. "…"
+            if measure_popup_text(title .. "\n" .. candidate) <= max_content_height then
+                low = middle
+            else
+                high = middle - 1
+            end
+        end
+        local prefix = low > 0 and table.concat(characters, "", 1, low) or ""
+        popup_text = title .. "\n" .. prefix .. "…"
+    end
     local dialog
     local can_edit_marker = true
     if marker then
@@ -1634,10 +1695,9 @@ function MarginPop:_showAnnotationActionMenu(annotation, index, marker)
             and doc:_checkIfWritable() == true
     end
     dialog = ButtonDialog:new{
-        title = title,
+        title = popup_text,
         title_align = "left",
-        width_factor = 0.98,
-        shrink_unneeded_width = true,
+        width = popup_width,
         anchor = function()
             return { y = Screen:getHeight() - Screen:scaleBySize(12) }
         end,
@@ -2600,8 +2660,10 @@ end
 
 function MarginPop:_newSidecarAnnotation(anchor, quote)
     local context = self:_contextValues({ anchor = anchor })
+    local created_at = os.time()
     local annotation = {
-        id = string.format("%d-%d", os.time(), #self.sidecar_annotations + 1),
+        id = string.format("%d-%d", created_at, #self.sidecar_annotations + 1),
+        created_at = created_at,
         anchor = anchor,
         text = quote and quote ~= "" and ('"' .. quote .. '"') or "",
         emoji = nil,
@@ -2883,10 +2945,14 @@ function MarginPop:_promptSidecarAnnotation(annotation, index)
             end,
         })
     end
+    local editor_face = Font:getFace("x_smallinfofont")
+    local editor_line_height = math.ceil(editor_face.size * 1.3)
     dialog = InputDialog:new{
         title = index and _("Edit annotation") or _("New annotation"),
         description = _("First line is the optional title; write the annotation below it."),
         input = initial_input,
+        input_face = editor_face,
+        text_height = editor_line_height * 3,
         allow_newline = true,
         fullscreen = self.annotation_editor_fullscreen,
         condensed = true,
@@ -3362,6 +3428,78 @@ function MarginPop:_collectAllHistoryAnnotations()
     return results, skipped
 end
 
+function MarginPop:_showHistoryExportFields()
+    local labels = {
+        book = _("Book"),
+        chapter = _("Chapter"),
+        source = _("Source"),
+        page = _("Page"),
+        emoji = _("Emoji"),
+        emoji_code = _("Emoji code"),
+        tags = _("Tags"),
+        timestamp = _("Timestamp"),
+    }
+    local fields = {}
+    for _, key in ipairs(HISTORY_EXPORT_FIELD_KEYS) do
+        fields[key] = self.history_export_fields[key]
+    end
+
+    local function open_settings()
+        local dialog
+        local rows = {}
+        local function save_and_redraw(updated)
+            if not self:_saveGlobalPreference(HISTORY_EXPORT_FIELDS_SETTING, updated) then
+                self:_notice(_("Could not save history export field preferences."))
+                return
+            end
+            fields = updated
+            self.history_export_fields = updated
+            UIManager:close(dialog)
+            UIManager:scheduleIn(0.05, open_settings)
+        end
+        local function field_button(key)
+            return {
+                text = (fields[key] and "[x] " or "[ ] ") .. labels[key],
+                callback = function()
+                    local updated = {}
+                    for _, field_key in ipairs(HISTORY_EXPORT_FIELD_KEYS) do
+                        updated[field_key] = fields[field_key]
+                    end
+                    updated[key] = not updated[key]
+                    save_and_redraw(updated)
+                end,
+            }
+        end
+
+        for index = 1, #HISTORY_EXPORT_FIELD_KEYS, 2 do
+            rows[#rows + 1] = {
+                field_button(HISTORY_EXPORT_FIELD_KEYS[index]),
+                field_button(HISTORY_EXPORT_FIELD_KEYS[index + 1]),
+            }
+        end
+        rows[#rows + 1] = {
+            { text = _("Reset defaults"), callback = function()
+                local updated = {}
+                for _, key in ipairs(HISTORY_EXPORT_FIELD_KEYS) do
+                    updated[key] = HISTORY_EXPORT_FIELD_DEFAULTS[key]
+                end
+                save_and_redraw(updated)
+            end },
+            { text = _("Done"), id = "close", callback = function()
+                UIManager:close(dialog)
+            end },
+        }
+        dialog = ButtonDialog:new{
+            title = _("History Export Fields"),
+            width_factor = 0.98,
+            buttons = rows,
+        }
+        UIManager:show(dialog)
+    end
+
+    open_settings()
+end
+
 function MarginPop:_exportAllHistoryAnnotations(group)
     local entries, skipped = self:_collectAllHistoryAnnotations()
     if not entries then
@@ -3388,7 +3526,30 @@ function MarginPop:_exportAnnotations(entries, options)
     local export_context = self.export_context or {
         book = true, chapter = true, page = true,
     }
+    local history_export_fields = self.history_export_fields
+        or HISTORY_EXPORT_FIELD_DEFAULTS
+    local is_history_export = options.history_group ~= nil
     local export_dialog
+    local show_export_dialog
+    local function created_timestamp(item)
+        local timestamp = tonumber(item.created_at or item.timestamp)
+        if not timestamp and type(item.id) == "string" then
+            timestamp = tonumber(item.id:match("^(%d+)%-"))
+        end
+        if timestamp and timestamp > 99999999999 then
+            timestamp = math.floor(timestamp / 1000)
+        end
+        if timestamp and (timestamp < 0 or timestamp > 253402300799) then
+            timestamp = nil
+        end
+        return timestamp
+    end
+    local function should_export_field(kind)
+        if is_history_export then
+            return history_export_fields[kind] == true
+        end
+        return export_context[kind] == true
+    end
     local function export_to(path_text, separate_files)
         local directory = (path_text or ""):match("^%s*(.-)%s*$")
         if directory == "" or directory:find("%z") or directory:sub(1, 1) ~= "/" then
@@ -3437,7 +3598,8 @@ function MarginPop:_exportAnnotations(entries, options)
             if page then
                 page = page + (tonumber(entry.page_offset) or self.page_offset or 0)
             end
-            local source = entry.marker and "PDF annotation" or "Book sidecar annotation"
+            local source = entry.marker
+                and _("PDF annotation") or _("Book sidecar annotation")
             local heading = (item.title or ""):gsub("[\r\n]+", " ")
             if heading:match("^%s*$") then
                 heading = string.format(_("Annotation %d"), index)
@@ -3448,22 +3610,35 @@ function MarginPop:_exportAnnotations(entries, options)
             if not chapter and (not entry.book_path or entry.book_path == (doc and doc.file)) then
                 chapter = self:_contextValues(item).chapter
             end
-            if export_context.book then
+            if should_export_field("book") then
                 lines[#lines + 1] = "- Book: "
                     .. tostring(book_title):gsub("[\r\n]", " ")
             end
-            if export_context.chapter and chapter and chapter ~= "" then
+            if should_export_field("chapter") and chapter and chapter ~= "" then
                 lines[#lines + 1] = "- Chapter: "
                     .. tostring(chapter):gsub("[\r\n]", " ")
             end
-            lines[#lines + 1] = "- Source: " .. source
-            if export_context.page and page then
+            if not is_history_export or should_export_field("source") then
+                lines[#lines + 1] = "- Source: " .. source
+            end
+            if should_export_field("page") and page then
                 lines[#lines + 1] = "- Page: " .. tostring(page)
             end
             if item.emoji then
-                lines[#lines + 1] = "- Emoji: " .. emoji_label(item.emoji)
-                lines[#lines + 1] = "- Emoji code: `" .. item.emoji .. "`"
-                lines[#lines + 1] = "- Tags: #" .. emoji_tag(item.emoji)
+                if not is_history_export or should_export_field("emoji") then
+                    lines[#lines + 1] = "- Emoji: " .. emoji_label(item.emoji)
+                end
+                if not is_history_export or should_export_field("emoji_code") then
+                    lines[#lines + 1] = "- Emoji code: `" .. item.emoji .. "`"
+                end
+                if not is_history_export or should_export_field("tags") then
+                    lines[#lines + 1] = "- Tags: #" .. emoji_tag(item.emoji)
+                end
+            end
+            local timestamp = created_timestamp(item)
+            if is_history_export and should_export_field("timestamp") and timestamp then
+                lines[#lines + 1] = "- Timestamp: "
+                    .. os.date("%Y-%m-%d %H:%M:%S", timestamp)
             end
             lines[#lines + 1] = ""
             lines[#lines + 1] = item.text or ""
@@ -3471,12 +3646,15 @@ function MarginPop:_exportAnnotations(entries, options)
             return table.concat(lines, "\n")
         end
 
+        local export_date = os.date("%y%m%d")
         if options.history_group == "annotation" then
             for index, entry in ipairs(entries) do
                 local item = entry.annotation or entry.marker
-                local stem = string.format("%03d-%s-%s", index,
-                    safe_filename(entry.book_title or title),
-                    safe_filename(item.title or item.text or item.emoji or "annotation"))
+                local timestamp = created_timestamp(item)
+                if not timestamp then
+                    timestamp = os.time()
+                end
+                local stem = os.date("%y%m%d%H%M%S", timestamp)
                 local saved, save_error = write_file(stem, markdown_for(entry, index))
                 if not saved then
                     self:_notice(_("Export stopped; could not save a note: ")
@@ -3489,7 +3667,7 @@ function MarginPop:_exportAnnotations(entries, options)
             for index, entry in ipairs(entries) do
                 local group_value = entry.book_title or title
                 local key = entry.book_path or group_value
-                local stem = safe_filename(group_value)
+                local stem = export_date .. "-" .. safe_filename(group_value)
                 if options.history_group == "chapter" then
                     local item = entry.annotation or entry.marker
                     local chapter = tostring(
@@ -3515,7 +3693,7 @@ function MarginPop:_exportAnnotations(entries, options)
                         grouped_entry.entry, grouped_entry.index)
                 end
                 local saved, save_error = write_file(
-                    group.stem .. "-annotations",
+                    group.stem,
                     table.concat(documents, "\n---\n\n"))
                 if not saved then
                     self:_notice(_("Export stopped; could not save a note: ")
@@ -3569,7 +3747,11 @@ function MarginPop:_exportAnnotations(entries, options)
         end
         self.export_context = updated
         export_context = updated
-        UIManager:setDirty(export_dialog, "ui")
+        local path_text = export_dialog:getInputText() or DEFAULT_EXPORT_DIR
+        UIManager:close(export_dialog)
+        UIManager:scheduleIn(0.05, function()
+            show_export_dialog(path_text)
+        end)
     end
 
     local function context_button(kind, label)
@@ -3584,43 +3766,47 @@ function MarginPop:_exportAnnotations(entries, options)
         }
     end
 
-    local action_buttons
-    if options.history_group then
-        action_buttons = {{
-            { text = _("Cancel"), id = "close", callback = function()
-                UIManager:close(export_dialog)
-            end },
-            { text = _("Export"), is_enter_default = true, callback = function()
-                export_to(export_dialog:getInputText(), false)
-            end },
-        }}
-    else
-        action_buttons = {{
-            { text = _("Cancel"), id = "close", callback = function()
-                UIManager:close(export_dialog)
-            end },
-            { text = _("Separate Markdown files"), callback = function()
-                export_to(export_dialog:getInputText(), true)
-            end },
-            { text = _("One Markdown file"), is_enter_default = true, callback = function()
-                export_to(export_dialog:getInputText(), false)
-            end },
-        }}
+    show_export_dialog = function(input_value)
+        local action_buttons
+        if options.history_group then
+            action_buttons = {{
+                { text = _("Cancel"), id = "close", callback = function()
+                    UIManager:close(export_dialog)
+                end },
+                { text = _("Export"), is_enter_default = true, callback = function()
+                    export_to(export_dialog:getInputText(), false)
+                end },
+            }}
+        else
+            action_buttons = {{
+                { text = _("Cancel"), id = "close", callback = function()
+                    UIManager:close(export_dialog)
+                end },
+                { text = _("Separate Markdown files"), callback = function()
+                    export_to(export_dialog:getInputText(), true)
+                end },
+                { text = _("One Markdown file"), is_enter_default = true, callback = function()
+                    export_to(export_dialog:getInputText(), false)
+                end },
+            }}
+        end
+        if not options.history_group then
+            action_buttons[#action_buttons + 1] = {
+                context_button("book", _("Book")),
+                context_button("chapter", _("Chapter")),
+                context_button("page", _("Page")),
+            }
+        end
+        export_dialog = InputDialog:new{
+            title = options.history_group
+                and _("Export annotation history") or _("Export selected annotations"),
+            input = input_value or DEFAULT_EXPORT_DIR,
+            buttons = action_buttons,
+        }
+        UIManager:show(export_dialog)
+        export_dialog:onShowKeyboard()
     end
-    action_buttons[#action_buttons + 1] = {
-        context_button("book", _("Book")),
-        context_button("chapter", _("Chapter")),
-        context_button("page", _("Page")),
-    }
-
-    export_dialog = InputDialog:new{
-        title = options.history_group
-            and _("Export annotation history") or _("Export selected annotations"),
-        input = DEFAULT_EXPORT_DIR,
-        buttons = action_buttons,
-    }
-    UIManager:show(export_dialog)
-    export_dialog:onShowKeyboard()
+    show_export_dialog(DEFAULT_EXPORT_DIR)
 end
 
 function MarginPop:_openAnnotationSearchEntry(entry, dialog)
@@ -4737,6 +4923,10 @@ end
 
 function MarginPop:addToMainMenu(menu_items)
     local history_export_items = {
+        {
+            text = _("History Export Fields"),
+            callback = function() self:_showHistoryExportFields() end,
+        },
         {
             text = _("Split by book"),
             callback = function() self:_exportAllHistoryAnnotations("book") end,

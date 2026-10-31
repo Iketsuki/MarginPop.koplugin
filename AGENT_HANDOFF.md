@@ -24,8 +24,8 @@ documents.
   List** provide one-shot placement and list/search access.
 - The annotation UI supports multiline notes, inline emoji quick rows, a
   paged OpenMoji picker, context insertion, and a global fullscreen preference
-  that defaults to compact mode. The editor can toggle layout without losing
-  its draft. OpenMoji artwork is monochrome SVG, not a general full-color emoji
+  that defaults to compact mode. The compact editor input shows at least three
+  lines. The editor can toggle layout without losing its draft. OpenMoji artwork is monochrome SVG, not a general full-color emoji
   set.
 - The editor previews the selected emoji by artwork and readable name; recent
   and favorite quick rows avoid duplicate entries. The first line of the note
@@ -49,7 +49,10 @@ documents.
   remain adjusted in memory through KOReader's rezoom and restore the original
   page-margin value on close; they do not overwrite the global preference.
 - Tapping an annotation opens a bottom-anchored action bar with its content and
-  Delete/Edit/Move/Cancel actions. Long-press still opens the editor directly.
+  Delete/Edit/Move/Cancel actions. It spans the screen width, preserves line
+  breaks, and stays within half the screen height. It does not scroll; long
+  previews are shortened with an ellipsis. Long-press still opens the editor
+  directly.
 - Margin text is grouped by anchor line and flows only up to the next annotation
   (or screen edge). Same-line emoji render in sidecar creation order, with
   per-group hit targets cached for tap/edit/move consistency.
@@ -77,6 +80,12 @@ documents.
   history and can split files by book, book/chapter, or annotation. Cached
   legacy PDF marker indexes are included when their document fingerprint
   matches; history export intentionally does not scan every PDF file.
+  **History Export Fields** is a separate global settings page for Book,
+  Chapter, Source, Page, Emoji, Emoji code, Tags, and Timestamp. Source and
+  Emoji default to omitted; changes persist immediately and redraw the page.
+  Group exports use `YYMMDD-book` or `YYMMDD-book-chapter` filenames. Per-note
+  filenames use the creation timestamp; legacy sidecars recover it from their
+  IDs, while untimestamped legacy PDF markers use export time.
 - The two marker-position reset actions restore legacy PDF marker overlays to
   their original positions (visible pages only, or all pages); they do not
   affect sidecar annotation anchors.
