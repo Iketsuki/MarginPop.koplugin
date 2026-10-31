@@ -1,59 +1,157 @@
-# PDF Translation Popup for KOReader / PDF 中文弹窗
+# MarginPop
 
-[English](#english) · [中文](#中文)
+MarginPop adds editable, searchable annotations to PDF, EPUB, and TXT books in
+KOReader. Notes can include text, an OpenMoji face, or both. Text-based anchors
+follow the book through reflow; PDF notes can also be embedded as standard PDF
+highlight/comment annotations for use in other readers.
 
-```text
-pdftranslationpopup.koplugin/   KOReader plugin / KOReader 插件
-helpers/                      Desktop PDF converter / 电脑端 PDF 转换工具
-LICENSE                       GNU AGPL v3
-```
+The plugin folder and internal settings/actions retain the legacy
+`marginpop` name for compatibility with existing KOReader gesture
+bindings and saved data. The user-facing plugin name is MarginPop.
 
-## English
+## Add and edit annotations
 
-Version **2.4.1** adds tappable popup notes, Chinese translations, and movable dots or OpenMoji faces to PDFs. The plugin interface is currently in Chinese. It displays text you enter or notes already stored in the PDF; it does not translate automatically.
+- **Annotation Mode** in the MarginPop menu, or the dispatcher action
+  **MarginPop: Add Annotation**, enables one-shot placement. Tap a location in
+  PDF, EPUB, or TXT; the editor opens and the mode exits when the annotation is
+  saved or canceled. Bind the dispatcher action to any KOReader gesture.
+- For EPUB/TXT, MarginPop anchors to a nearby text position. Fixed-layout PDF
+  notes store their page position; reflowed PDF notes use a native PDF
+  position when it can be resolved, or a page-relative fallback when OCR/text
+  positioning is unavailable. PDF placement can be configured to use the
+  nearest text item or its right margin.
+- Use **Add annotation** in the text-selection menu to create a note at the
+  selection endpoint, including PDF text-layer selections. The selected quote
+  is inserted into the note by default. **Annotate Selected Text by Default**
+  skips KOReader's selection action menu and opens the annotation editor
+  directly; turn it off to restore the normal menu.
+- Tap an existing annotation to open a compact action bar at the bottom of the
+  screen with its content and **Delete**, **Edit**, **Move**, and **Cancel**.
+  Long-press opens the editor directly. **Save & Move** also arms a one-shot
+  move: tap the new location to relocate it. The selected emoji is
+  contrast-inverted while the move is pending.
+- Editors support multiline notes and scrolling. **Fullscreen Annotation
+  Editor** toggles the layout from the MarginPop menu or from inside the
+  editor. Compact mode is the default; the preference is global.
+- The note editor provides inline quick emoji rows, plus the full paged
+  OpenMoji picker. The selected face is previewed by name and artwork. Recent
+  and favorite rows do not repeat the same face. In the picker, long-press a
+  recent emoji to favorite it, or a favorite to remove it. The bundled
+  OpenMoji artwork is monochrome SVG.
+- There is no separate title prompt. The first editor line is an optional
+  Markdown title; start the note on the next line. A selected quote starts
+  below the blank title line. Titles can be edited directly in the same editor.
+- **Annotation Display Controls** provides compact left/right adjustments for
+  emoji size, text size, and text margin width, plus emoji position, text side,
+  and visibility controls. Tap the numeric value between the +/- buttons to
+  enter an exact number. The **Text on:** row independently toggles EPUB, TXT,
+  fixed-page PDF, and PDF reflow. PDF reflow can override the normal emoji
+  position with Left, Anchor, or Right. Emoji position and annotation-text side
+  are independent: put emoji near the anchored item or in either margin, and
+  put the note text in the left or right text margin. Emoji and note text are
+  laid out separately to avoid overlap.
+  Only the text-margin width reserves page-layout space; emoji do not enlarge
+  that margin. Text appears without a separator, grows until the next annotation
+  (or the screen edge), and is clipped there to avoid covering the next note.
+  Line breaks display as spaces, and clipped notes do not get an ellipsis.
+  Emoji on the same line are shown in creation order.
+- Annotation text is shown by default in EPUB, TXT, and fixed-page PDF; each
+  format can be toggled independently. Text in PDF reflow is separately
+  configurable and defaults off. Text size
+  defaults to 2 and can be adjusted from 1 to 24; emoji size defaults to 12
+  and can be adjusted from 2 to 64. The text
+  margin width can be adjusted independently of KOReader's normal
+  margins. EPUB/TXT and PDF reflow reserve space on the selected text side when
+  KOReader exposes text-layout margins. Fixed-layout PDF margins remain
+  adjusted in memory through KOReader's rezoom, then restore the original
+  page-margin setting when the document closes; the adjustment does not change
+  the global preference. PDF zoom reserves both sides while the text rail
+  remains on the chosen side. Setting width to 0 disables extra layout
+  reservation but keeps the overlay visible.
+- The **Book**, **Chapter**, and **Page** buttons immediately insert context at
+  the text cursor. Long-press a button to configure its global insertion
+  format, using `{title}`, `{chapter}`, and `{page}` placeholders. Insertions
+  do not add line breaks unless the chosen format includes one. Page-number
+  offset is configurable per book; the inserted number is the current/displayed
+  page plus that offset. A PDF page number falls back to the current PDF page.
 
-### Install the plugin
+## Search and export
 
-1. Download this repository using **Code → Download ZIP** and extract it, or clone the repository.
-2. Copy only the **`pdftranslationpopup.koplugin` folder** into your KOReader `plugins/` directory. The path must be `koreader/plugins/pdftranslationpopup.koplugin/main.lua`.
-3. Restart KOReader and open a PDF. Find **PDF 中文弹窗** in the document menu.
+Open **Annotation List** from the MarginPop menu or use the dispatcher action
+**MarginPop: Annotation List** to open the results directly. **Search
+Annotations** opens a separate search form for note text with an optional
+emoji filter. The full-screen scrollable list uses plain text rows without emoji
+artwork; use the emoji picker on the search page to filter by a face. PDF
+legacy-marker indexing runs in small background batches rather than blocking
+the reader; the first results include sidecar and visible-page annotations,
+and the list can be reopened after indexing finishes. Results are left-aligned
+and can be selected individually or in bulk. Long-press a result to filter by
+its emoji.
+Results can be selected individually or in bulk, opened at their anchor, or
+exported as Markdown.
 
-### Use it
+Export supports one combined Markdown file or separate files. The path field
+starts at `<KOReader folder>/popupExport`; enter an absolute folder path.
+The target folder is created if its parent exists, and existing files are not
+overwritten. The export dialog has global include/omit controls for book,
+chapter, and page metadata. Exported page numbers use that book's saved page
+offset. Emoji metadata includes the readable name, OpenMoji code, and a
+`#tag`.
 
-- Turn off PDF text reflow.
-- Select **添加圆点模式 → 进入／退出添加模式**, tap the page, and enter a note. Select **表情…** to choose a face.
-- Tap a marker to read its popup. In add mode, tap a marker to edit its text or face.
-- Long-press a marker, then tap a new position on the same page to move it.
-- Close the document normally to embed changes before sharing the PDF. Pending edits are saved in the KOReader sidecar while the document is open. Adding or embedding edits requires a writable PDF.
+**Export All History Annotations** can split Markdown files by book, by book
+and chapter, or into one file per annotation. It reads MarginPop sidecar
+annotations from KOReader's reading history and includes legacy PDF marker
+entries when their lightweight marker index is already cached; it does not
+open every historical PDF to scan uncached legacy markers.
 
-To convert existing PDF text-note annotations on your computer, use the [helper instructions in English and Chinese](helpers/README.md). Conversion is optional when adding notes directly in KOReader. Recipients need this plugin to see its custom markers and popups.
+## PDF embedding
 
-See [detailed plugin behavior and storage format](pdftranslationpopup.koplugin/README.md).
+New sidecar annotations on PDFs are also staged as standard PDF highlight
+annotations with comment text. The comment contains an `@KOPOP_EMOJI` code
+when an emoji is selected, a readable hashtag, and the note text. It does not
+use MarginPop's legacy `KOPOPZH2`, `@KOPOP_POS`, or emoji-size payload.
 
-## 中文
+**Embed Notes in PDF on Close** is enabled by default for each PDF and can be
+disabled per book. Changes are journaled in the KOReader book sidecar while
+reading, then batched into one PDF write when the document closes normally.
+Edits, moves, and deletions are synchronized with the embedded comments. If
+the PDF is read-only or writing fails, the sidecar remains the recoverable
+copy and MarginPop reports the failure. Disabling automatic embedding does
+not remove comments already written to the PDF; edits or deletions made while
+embedding is disabled are not synchronized to existing PDF comments.
 
-版本 **2.4.1**：在 KOReader 中为 PDF 添加可点击的文字弹窗、中文译文，以及可移动的圆点或 OpenMoji 表情。插件界面目前为中文。插件显示你输入的文字或 PDF 已有的注释，**不会自动翻译**。
+The PDF embedding option applies to MarginPop sidecar annotations; it does not
+convert or remove existing legacy PDF markers. Existing `KOPOPZH1` and
+`KOPOPZH2` markers remain readable and editable with their original behavior.
+Legacy `KOPOPZH2` marker position changes also use the plugin's sidecar
+journal and batched, clean-close PDF writeback.
 
-### 安装插件
+## Storage and compatibility
 
-1. 点击 **Code → Download ZIP** 下载本仓库并解压，或克隆仓库。
-2. 只将 **`pdftranslationpopup.koplugin` 文件夹**复制到 KOReader 的 `plugins/` 目录。最终路径应为 `koreader/plugins/pdftranslationpopup.koplugin/main.lua`。
-3. 重启 KOReader，打开 PDF，在文档菜单中找到 **PDF 中文弹窗**。
+- EPUB/TXT annotations, PDF sidecar anchors, emoji history/favorites, and
+  per-book page offsets are stored in KOReader's document sidecar.
+- PDF sidecar annotations retain their anchor and PDF-export snapshot in that
+  sidecar so edits and deletes can be reconciled with the native PDF comment.
+- The searchable index of legacy PDF markers is cached in the book sidecar,
+  so reopening the annotation list does not rescan every PDF page.
+- PDF marker position changes and pending additions/deletions are journaled
+  before PDF writeback. The plugin avoids repeated writes to an open MuPDF
+  document and verifies the saved PDF before clearing its pending journal.
+- The visible-page and all-page reset actions restore legacy PDF marker
+  overlays to their original positions; they do not move sidecar annotations.
+- Existing gesture bindings and settings are retained under the legacy
+  `marginpop` identifiers.
 
-### 使用方法
+## Limitations
 
-- 关闭 PDF 文字重排。
-- 选择 **添加圆点模式 → 进入／退出添加模式**，点击页面并输入注释；点击 **表情…** 可选择表情。
-- 点击圆点或表情查看弹窗；在添加模式下点击已有标记，可编辑文字或表情。
-- 长按标记，再点击同一页的新位置，即可移动标记。
-- 分享 PDF 前，请正常关闭文档，将改动写入 PDF。文档打开期间，待写入改动保存在 KOReader 的 sidecar 中。添加注释和写入改动需要 PDF 文件可写。
+- PDF text anchoring depends on KOReader/MuPDF page-position and text/OCR data.
+  If no text item can be resolved, MarginPop uses a page-relative anchor where
+  possible; this preserves placement but is less semantically stable than a
+  text anchor.
+- Embedded PDF comments are written on normal document close, not immediately
+  after each edit. Keep the KOReader sidecar with the book until that write
+  succeeds.
+- Color emoji artwork is not bundled. The included OpenMoji faces are
+  monochrome.
 
-如需在电脑上转换 PDF 已有的文字便笺注释，请阅读 [转换工具中英文说明](helpers/README.md)。直接在 KOReader 中添加注释时，无需先转换。接收者需要安装本插件，才能显示这些自定义标记和弹窗。
-
-更多细节见 [插件交互与存储格式说明](pdftranslationpopup.koplugin/README.md)。
-
-## License / 许可
-
-Plugin and helper source retain the original repository's [GNU AGPL v3 license](LICENSE). The plugin was extracted from [rubyxs/koreader](https://github.com/rubyxs/koreader/tree/6ddffef2583fab5f172d4b2663f86e96ee965354/plugins/pdftranslationpopup.koplugin); the converter comes from its `tools/popupconverter/` directory. The 126 bundled OpenMoji SVGs are separately licensed under CC BY-SA 4.0; see [artwork attribution](pdftranslationpopup.koplugin/OPENMOJI.md).
-
-插件及辅助工具代码沿用原仓库的 [GNU AGPL v3 许可](LICENSE)。126 个 OpenMoji SVG 图案单独采用 CC BY-SA 4.0 许可，详见 [图案来源与署名](pdftranslationpopup.koplugin/OPENMOJI.md)。
+The bundled OpenMoji artwork is attributed in [OPENMOJI.md](./OPENMOJI.md).
