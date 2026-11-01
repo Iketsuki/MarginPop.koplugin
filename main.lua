@@ -11,6 +11,7 @@ local Notification = require("ui/widget/notification")
 local RenderText = require("ui/rendertext")
 local RenderImage = require("ui/renderimage")
 local TextBoxWidget = require("ui/widget/textboxwidget")
+local TextViewer = require("ui/widget/textviewer")
 local Size = require("ui/size")
 local Screen = Device.screen
 local UIManager = require("ui/uimanager")
@@ -38,6 +39,8 @@ local CONTEXT_FORMATS_SETTING = "marginpop_context_formats_v1"
 local EXPORT_CONTEXT_SETTING = "marginpop_export_context_v1"
 local HISTORY_EXPORT_FIELDS_SETTING = "marginpop_history_export_fields_v1"
 local PDF_MARKER_INDEX_SETTING = "marginpop_pdf_marker_index_v1"
+local ANNOTATION_RESULTS_PAGE_SIZE = 20
+local NOTEBOOK_SYNC_SETTING = "marginpop_notebook_sync_v1"
 local ANNOTATION_MARGIN_WIDTH_SETTING = "marginpop_annotation_margin_width_v1"
 local ANNOTATION_MARGIN_SIDE_SETTING = "marginpop_annotation_margin_side_v1"
 local ANNOTATION_SHOW_TEXT_SETTING = "marginpop_annotation_show_text_v1"
@@ -71,6 +74,8 @@ local HISTORY_EXPORT_FIELD_DEFAULTS = {
 local HISTORY_EXPORT_FIELD_KEYS = {
     "book", "chapter", "source", "page", "emoji", "emoji_code", "tags", "timestamp",
 }
+local NOTEBOOK_BLOCK_SEPARATOR = "\n\n--- MarginPop ---\n\n"
+local NOTEBOOK_BLOCK_SEPARATOR_LINE = "--- MarginPop ---"
 
 -- Keep the plugin loadable if an older installation has not copied the new
 -- artwork/catalog yet; the add-mode gesture must still work for plain dots.
@@ -238,6 +243,89 @@ local function annotation_entry_key(entry)
         or ("sidecar:" .. tostring(entry.index))
 end
 
+local function notebook_block_for(title, text, page_context)
+    local lines = {}
+    if type(title) == "string" and title ~= "" then
+        lines[#lines + 1] = title
+    end
+    if type(text) == "string" and text ~= "" then
+        lines[#lines + 1] = text
+    end
+    if type(page_context) == "string" and page_context ~= "" then
+        lines[#lines + 1] = page_context
+    end
+    return table.concat(lines, "\n")
+end
+
+local function remove_notebook_page_context(block, page_context)
+    if type(page_context) ~= "string" or page_context == "" then return block end
+    local search_from = 1
+    while true do
+        local first = block:find(page_context, search_from, true)
+        if not first then break end
+        local last = first + #page_context - 1
+        local at_line_start = first == 1 or block:sub(first - 1, first - 1) == "\n"
+        local at_line_end = last == #block or block:sub(last + 1, last + 1) == "\n"
+        if at_line_start and at_line_end then
+            if last < #block and block:sub(last + 1, last + 1) == "\n" then
+                block = block:sub(1, first - 1) .. block:sub(last + 2)
+            elseif first > 1 then
+                block = block:sub(1, first - 2) .. block:sub(last + 1)
+            else
+                block = block:sub(last + 1)
+            end
+            search_from = 1
+        else
+            search_from = last + 1
+        end
+    end
+    return block
+end
+
+local function escape_notebook_block(block)
+    block = block:gsub("\n" .. NOTEBOOK_BLOCK_SEPARATOR_LINE .. "\n",
+        "\n\\" .. NOTEBOOK_BLOCK_SEPARATOR_LINE .. "\n")
+    if block == NOTEBOOK_BLOCK_SEPARATOR_LINE then
+        return "\\" .. block
+    end
+    if block:sub(1, #NOTEBOOK_BLOCK_SEPARATOR_LINE + 1)
+        == NOTEBOOK_BLOCK_SEPARATOR_LINE .. "\n" then
+        block = "\\" .. block
+    end
+    if block:sub(-#NOTEBOOK_BLOCK_SEPARATOR_LINE - 1)
+        == "\n" .. NOTEBOOK_BLOCK_SEPARATOR_LINE then
+        block = block .. "\\"
+    end
+    return block
+end
+
+local function split_notebook_blocks(contents)
+    contents = (contents or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+    local blocks = {}
+    local start = 1
+    while true do
+        local separator_start, separator_end =
+            contents:find(NOTEBOOK_BLOCK_SEPARATOR, start, true)
+        local block = contents:sub(start, separator_start and separator_start - 1 or -1)
+        block = block:gsub("\n\\" .. NOTEBOOK_BLOCK_SEPARATOR_LINE .. "\n",
+            "\n" .. NOTEBOOK_BLOCK_SEPARATOR_LINE .. "\n")
+        if block ~= "" then blocks[#blocks + 1] = block end
+        if not separator_start then break end
+        start = separator_end + 1
+    end
+    return blocks
+end
+
+local function join_notebook_blocks(blocks)
+    local escaped = {}
+    for _, block in ipairs(blocks or {}) do
+        if type(block) == "string" and block ~= "" then
+            escaped[#escaped + 1] = escape_notebook_block(block)
+        end
+    end
+    return table.concat(escaped, NOTEBOOK_BLOCK_SEPARATOR)
+end
+
 function MarginPop:_activate()
     if self.ui and self.ui.document then
         ACTIVE[self.ui] = self
@@ -282,6 +370,9 @@ function MarginPop:_savePositions()
                 logger.warn("PDF popup sidecar save failed:", saved)
                 return false
             end
+        end
+        if not self.notebook_sync_suppressed and self._scheduleNotebookSync then
+            self:_scheduleNotebookSync()
         end
         return true
     end
@@ -409,6 +500,9 @@ function MarginPop:init()
     self.embed_pdf_notes = true
     self.pending_pdf_note_updates = nil
     self.sidecar_annotations = {}
+    self.notebook_sync_state = { records = {}, unlinked = {}, initialized = false }
+    self.notebook_sync_busy = false
+    self.notebook_sync_after_index = false
     self.emoji_history = {}
     self.emoji_favorites = {}
     self.add_mode = false
@@ -479,6 +573,20 @@ function MarginPop:onDispatcherRegisterActions()
         title = _("MarginPop: Annotation List"),
         general = true,
     })
+    Dispatcher:removeAction("marginpop_annotation_search")
+    Dispatcher:registerAction("marginpop_annotation_search", {
+        category = "none",
+        event = "MarginPopAnnotationSearch",
+        title = _("MarginPop: Search Annotations"),
+        general = true,
+    })
+    Dispatcher:removeAction("marginpop_open_notebook")
+    Dispatcher:registerAction("marginpop_open_notebook", {
+        category = "none",
+        event = "MarginPopOpenNotebook",
+        title = _("MarginPop: Open Book Notebook"),
+        general = true,
+    })
 end
 
 function MarginPop:onMarginPopAddDot()
@@ -503,12 +611,109 @@ function MarginPop:onMarginPopAnnotationList()
     if not index_complete then
         self:_startPdfMarkerIndexBuild()
     end
-    if #results == 0 then
-        self:_notice(index_complete and _("No annotations found in this book.")
-            or _("PDF annotation indexing is running. Reopen the list when it finishes."))
+    if #results == 0 and index_complete then
+        self:_notice(_("No annotations found in this book."))
         return true
     end
-    self:_showAnnotationResults("", nil, results, {})
+    self:_showAnnotationResults("", nil, results, {}, 1, not index_complete)
+    return true
+end
+
+function MarginPop:onMarginPopAnnotationSearch()
+    self:_showSidecarAnnotationSearch("", nil, {})
+    return true
+end
+
+function MarginPop:_insertNotebookContext(editor, kind)
+    local doc = self.ui and self.ui.document
+    local page = doc and doc.getCurrentPage and doc:getCurrentPage()
+    local annotation = { anchor = { page = page } }
+    return self:_insertContextIntoEditor(editor and editor.input, annotation, kind)
+end
+
+function MarginPop:_installNotebookEditorButtons(editor, path)
+    if not editor then return false end
+    editor._marginpop_notebook_path = path
+    editor._marginpop_context_plugin = self
+    if editor._marginpop_edit_file_wrapped then return true end
+
+    local original_edit_file = editor.editFile
+    if type(original_edit_file) ~= "function" then return false end
+    editor.editFile = function(text_editor, file_path, readonly, caller_callback)
+        if file_path ~= text_editor._marginpop_notebook_path then
+            return original_edit_file(text_editor, file_path, readonly, caller_callback)
+        end
+        local InputDialog = require("ui/widget/inputdialog")
+        local original_new = InputDialog.new
+        -- TextEditor constructs and shows its InputDialog synchronously here.
+        InputDialog.new = function(dialog_class, params)
+            if params and type(params.buttons) == "table" then
+                params.buttons[#params.buttons + 1] = {
+                    {
+                        text = _("Chapter"),
+                        callback = function()
+                            text_editor._marginpop_context_plugin
+                                :_insertNotebookContext(text_editor, "chapter")
+                        end,
+                        hold_callback = function()
+                            text_editor._marginpop_context_plugin:_editContextFormat("chapter")
+                        end,
+                    },
+                    {
+                        text = _("Page"),
+                        callback = function()
+                            text_editor._marginpop_context_plugin
+                                :_insertNotebookContext(text_editor, "page")
+                        end,
+                        hold_callback = function()
+                            text_editor._marginpop_context_plugin:_editContextFormat("page")
+                        end,
+                    },
+                }
+            end
+            return original_new(dialog_class, params)
+        end
+        local ok, err = pcall(
+            original_edit_file, text_editor, file_path, readonly, caller_callback)
+        InputDialog.new = original_new
+        if not ok then error(err) end
+    end
+    editor._marginpop_edit_file_wrapped = true
+    return true
+end
+
+function MarginPop:onMarginPopOpenNotebook()
+    local synced, sync_error = self:_syncNotebook(false)
+    if not synced then
+        logger.warn("MarginPop notebook sync failed before open:", sync_error)
+        return true
+    end
+    local path = self:_notebookPath()
+    if not path then
+        self:_notice(_("The book has no notebook path."))
+        return true
+    end
+    local editor = self.ui and self.ui.texteditor
+    if editor and editor.openFile then
+        self:_installNotebookEditorButtons(editor, path)
+        local opened, open_error = pcall(editor.openFile, editor, path, function()
+            UIManager:scheduleIn(0.1, function()
+                if self.ui and self.ui.document then self:_syncNotebook(false) end
+            end)
+        end)
+        if not opened or open_error == false then
+            local err = opened and _("The notebook editor could not open the file.")
+                or open_error
+            logger.warn("MarginPop could not open the book notebook:", err)
+            self:_notice(_("Could not open the book notebook: ") .. tostring(err))
+        end
+    else
+        local opened, open_error = pcall(TextViewer.openFile, path)
+        if not opened then
+            logger.warn("MarginPop could not open the book notebook:", open_error)
+            self:_notice(_("Could not open the book notebook: ") .. tostring(open_error))
+        end
+    end
     return true
 end
 
@@ -524,6 +729,11 @@ function MarginPop:onReaderReady()
     self:_capturePdfPageMargin()
     self:_applyAnnotationMargins()
     self:_registerSelectionMenuItem()
+    local notebook_path = self:_notebookPath()
+    if notebook_path then
+        self:_installNotebookEditorButtons(self.ui and self.ui.texteditor, notebook_path)
+    end
+    self:_scheduleNotebookSync()
     local path = self.ui and self.ui.document and self.ui.document.file
     if path ~= self.open_pdf_path then
         self.pdf_write_attempted = false
@@ -538,6 +748,10 @@ function MarginPop:onSuspend()
 end
 
 function MarginPop:onCloseDocument()
+    local notebook_synced, notebook_error = self:_syncNotebook(false)
+    if not notebook_synced then
+        logger.warn("MarginPop notebook sync failed on document close:", notebook_error)
+    end
     self:_restorePdfPageMargin()
     -- Sidecar is the crash-safe journal while reading. On a clean close, batch
     -- pending marker changes and portable PDF note comments into one PDF write.
@@ -598,6 +812,7 @@ function MarginPop:_loadSidecarAnnotations()
     local settings = self.ui and self.ui.doc_settings
     if not settings then return end
     local annotations = settings:readSetting(SIDECAR_ANNOTATIONS_SETTING)
+    local notebook_sync = settings:readSetting(NOTEBOOK_SYNC_SETTING)
     local history = settings:readSetting(EMOJI_HISTORY_SETTING)
     local favorites = settings:readSetting(EMOJI_FAVORITES_SETTING)
     local pending_pdf_deletes = settings:readSetting(PDF_NOTE_DELETES_SETTING)
@@ -648,6 +863,35 @@ function MarginPop:_loadSidecarAnnotations()
             self.sidecar_annotations[#self.sidecar_annotations + 1] = annotation
         else
             logger.warn("PDF popup skipped an invalid sidecar annotation")
+        end
+    end
+    self.notebook_sync_state = {
+        records = {},
+        unlinked = {},
+        initialized = type(notebook_sync) == "table" and notebook_sync.initialized == true,
+    }
+    if type(notebook_sync) == "table" then
+        if type(notebook_sync.records) == "table" then
+            for _, record in ipairs(notebook_sync.records) do
+                if type(record) == "table"
+                    and (record.id == nil or type(record.id) == "string")
+                    and type(record.block) == "string" then
+                    self.notebook_sync_state.records[#self.notebook_sync_state.records + 1] = {
+                        id = record.id,
+                        block = record.block,
+                        has_title = record.has_title == true,
+                        page_context = type(record.page_context) == "string"
+                            and record.page_context or nil,
+                    }
+                end
+            end
+        end
+        if type(notebook_sync.unlinked) == "table" then
+            for id, unlinked in pairs(notebook_sync.unlinked) do
+                if type(id) == "string" and unlinked == true then
+                    self.notebook_sync_state.unlinked[id] = true
+                end
+            end
         end
     end
     self.pending_pdf_note_deletes = {}
@@ -724,6 +968,8 @@ function MarginPop:_saveSidecarAnnotations()
     local settings = self.ui and self.ui.doc_settings
     if not settings then return false end
     settings:saveSetting(SIDECAR_ANNOTATIONS_SETTING, self.sidecar_annotations or {})
+    settings:saveSetting(NOTEBOOK_SYNC_SETTING,
+        self.notebook_sync_state or { records = {}, unlinked = {} })
     settings:saveSetting(EMOJI_HISTORY_SETTING, self.emoji_history or {})
     settings:saveSetting(EMOJI_FAVORITES_SETTING, self.emoji_favorites or {})
     settings:saveSetting(PAGE_OFFSET_SETTING, self.page_offset or 0)
@@ -759,6 +1005,643 @@ function MarginPop:_saveSidecarAnnotations()
             logger.warn("PDF popup annotation sidecar save failed:", saved)
             return false
         end
+    end
+    if not self.notebook_sync_suppressed and self._scheduleNotebookSync then
+        self:_scheduleNotebookSync()
+    end
+    return true
+end
+
+function MarginPop:_notebookPath()
+    local settings = self.ui and self.ui.doc_settings
+    local path = settings and settings:readSetting("notebook_file")
+    if type(path) ~= "string" or path == "" then
+        local global_settings = rawget(_G, "G_reader_settings")
+        path = global_settings and global_settings:readSetting("notebook_file")
+    end
+    if type(path) ~= "string" or path == "" then
+        local doc = self.ui and self.ui.document
+        path = doc and doc.file and (doc.file .. ".txt")
+    end
+    return path
+end
+
+function MarginPop:_readNotebook(path)
+    if not path then return nil, _("The book has no notebook path.") end
+    local file, err = io.open(path, "rb")
+    if not file then
+        if not lfs.attributes(path) then return "" end
+        return nil, err
+    end
+    local contents, read_error = file:read("*a")
+    local closed, close_error = file:close()
+    if contents == nil then return nil, read_error end
+    if closed == nil then return nil, close_error end
+    return contents
+end
+
+function MarginPop:_writeNotebook(path, contents)
+    if not path then return false, _("The book has no notebook path.") end
+    local temporary = path .. ".marginpop-tmp"
+    local file, err = io.open(temporary, "wb")
+    if not file then return false, err end
+    local written, write_error = file:write(contents)
+    local closed, close_error = file:close()
+    if not written or closed == nil then
+        os.remove(temporary)
+        return false, write_error or close_error
+    end
+    local renamed, rename_error = os.rename(temporary, path)
+    if not renamed then
+        os.remove(temporary)
+        return false, rename_error
+    end
+    return true
+end
+
+function MarginPop:_notebookEntries(force_all_pdf, append_missing)
+    local entries, known = {}, {}
+    for index, annotation in ipairs(self.sidecar_annotations or {}) do
+        if type(annotation.id) ~= "string" or annotation.id == "" then
+            annotation.id = string.format("marginpop-%d-%d", os.time(), index)
+        end
+        local id = "sidecar:" .. annotation.id
+        entries[#entries + 1] = {
+            id = id, kind = "sidecar", annotation = annotation, index = index,
+            title = annotation.title, text = annotation.text or "",
+            emoji = annotation.emoji,
+            page_context = self:_insertableContext({
+                anchor = annotation.anchor,
+            }, "page"),
+        }
+        known[id] = true
+    end
+
+    local doc = self.ui and self.ui.document
+    local complete = true
+    if doc and doc.is_pdf then
+        local markers
+        markers, complete = self:_getPdfMarkerIndex(false)
+        if not complete and force_all_pdf then
+            self.notebook_sync_after_index = {
+                force_all_pdf = true,
+                append_missing = append_missing == true,
+            }
+            self:_startPdfMarkerIndexBuild()
+        end
+        for _, marker_entry in ipairs(markers) do
+            if type(marker_entry) == "table" and type(marker_entry.key) == "string"
+                and type(marker_entry.page) == "number" then
+                local marker = {
+                    page = marker_entry.page,
+                    key = marker_entry.key,
+                }
+                local text, emoji = marker_entry.text or "", marker_entry.emoji
+                for _, pending in ipairs(self.pending_annotations or {}) do
+                    if pending.key == marker.key and pending.kind == "edit" then
+                        text, emoji = pending.text or "", pending.emoji
+                    end
+                end
+                local id
+                if type(marker_entry.x) == "number" and type(marker_entry.y) == "number" then
+                    id = string.format("pdf:%d:%.5f:%.5f",
+                        marker.page, marker_entry.x, marker_entry.y)
+                else
+                    id = "pdf:" .. marker.key
+                end
+                if not known[id] then
+                    entries[#entries + 1] = {
+                        id = id, kind = "pdf", marker = marker, page = marker.page,
+                        title = nil, text = text, emoji = emoji,
+                        page_context = self:_insertableContext({
+                            anchor = { page = marker.page },
+                        }, "page"),
+                    }
+                    known[id] = true
+                end
+            end
+        end
+        for _, pending in ipairs(self.pending_annotations or {}) do
+            if pending.kind == "add" and type(pending.key) == "string"
+                and type(pending.page) == "number"
+                and type(pending.x) == "number" and type(pending.y) == "number" then
+                local id = string.format("pdf:%d:%.5f:%.5f",
+                    pending.page, pending.x, pending.y)
+                if not known[id] then
+                    entries[#entries + 1] = {
+                        id = id,
+                        kind = "pdf",
+                        marker = { page = pending.page, key = pending.key },
+                        page = pending.page,
+                        title = nil,
+                        text = pending.text or "",
+                        emoji = pending.emoji,
+                        page_context = self:_insertableContext({
+                            anchor = { page = pending.page },
+                        }, "page"),
+                    }
+                    known[id] = true
+                end
+            end
+        end
+    end
+    return entries, complete
+end
+
+function MarginPop:_notebookBlock(entry)
+    local text = type(entry.text) == "string" and entry.text or ""
+    if text == "" and entry.emoji then
+        text = "[" .. emoji_label(entry.emoji) .. "]"
+    end
+    return notebook_block_for(entry.title, text, entry.page_context)
+end
+
+function MarginPop:_notebookItemById(entries, id)
+    for _, entry in ipairs(entries) do
+        if entry.id == id then return entry end
+    end
+end
+
+function MarginPop:_nearestNotebookEntry(entries)
+    if #entries == 0 then return nil end
+    local doc = self.ui and self.ui.document
+    local page = doc and doc.getCurrentPage and doc:getCurrentPage()
+    local screen = { x = math.floor(Screen:getWidth() / 2), y = math.floor(Screen:getHeight() / 2) }
+    local nearest, nearest_distance
+    for _, entry in ipairs(entries) do
+        local unlinked = self.notebook_sync_state
+            and self.notebook_sync_state.unlinked
+            and self.notebook_sync_state.unlinked[entry.id]
+        if not unlinked then
+            local item_page = entry.page
+            local center_x, center_y
+            if entry.kind == "sidecar" then
+                local anchor = entry.annotation.anchor or {}
+                item_page = item_page or anchor.page
+                    or (type(anchor.xpointer) == "table" and anchor.xpointer.page)
+                center_x, center_y = self:_annotationScreenCenter(entry.annotation)
+            elseif entry.kind == "pdf" and item_page == page then
+                local marker = self:_resolveIndexedPdfMarker(entry)
+                if marker then
+                    center_x, center_y = self:_pdfNativeToScreenCenter(
+                        entry.page, marker.base_x, marker.base_y)
+                end
+            end
+            local distance = item_page and page
+                and math.abs(item_page - page) * Screen:getHeight() or 0
+            if center_x and center_y and (not item_page or item_page == page) then
+                local dx, dy = center_x - screen.x, center_y - screen.y
+                distance = dx * dx + dy * dy
+            elseif distance == 0 and page then
+                distance = Screen:getHeight()
+            end
+            if not nearest_distance or distance < nearest_distance then
+                nearest, nearest_distance = entry, distance
+            end
+        end
+    end
+    return nearest
+end
+
+function MarginPop:_appendNotebookText(entry, text)
+    if entry.kind == "sidecar" then
+        local annotation = entry.annotation
+        local previous = annotation.text or ""
+        annotation.text = previous == "" and text or (previous .. "\n\n" .. text)
+        annotation.emoji_tag = emoji_tag(annotation.emoji)
+        entry.text = annotation.text
+        entry.title = annotation.title
+        return true
+    end
+    local marker = self:_resolveIndexedPdfMarker(entry)
+    if not marker then return false, _("The PDF annotation could not be found.") end
+    local pending
+    for _, candidate in ipairs(self.pending_annotations or {}) do
+        if candidate.kind == "edit" and candidate.key == marker.key then
+            pending = candidate
+            break
+        end
+    end
+    local created = not pending
+    if not pending then
+        pending = { kind = "edit", key = marker.key }
+        self.pending_annotations[#self.pending_annotations + 1] = pending
+    end
+    local previous_text, previous_emoji, previous_size =
+        pending.text, pending.emoji, pending.emoji_size
+    pending.text = (pending.text or marker.text or "") == ""
+        and text or ((pending.text or marker.text or "") .. "\n\n" .. text)
+    pending.emoji = pending.emoji or marker.emoji
+    pending.emoji_size = pending.emoji_size or marker.emoji_size
+    entry.text = pending.text
+    entry.emoji = pending.emoji
+    if not self:_savePositions() then
+        if created then
+            table.remove(self.pending_annotations)
+        else
+            pending.text, pending.emoji, pending.emoji_size =
+                previous_text, previous_emoji, previous_size
+        end
+        return false, _("Could not save the pending PDF annotation update.")
+    end
+    return true
+end
+
+function MarginPop:_updateNotebookEntry(entry, block, has_title, previous_page_context)
+    block = remove_notebook_page_context(block, previous_page_context)
+    if entry.kind == "sidecar" then
+        local title, text = nil, block
+        if has_title then
+            local newline = block:find("\n", 1, true)
+            if newline then
+                title, text = block:sub(1, newline - 1), block:sub(newline + 1)
+            else
+                title, text = block, ""
+            end
+            if title == "" then title = nil end
+        end
+        entry.annotation.title = title
+        entry.annotation.text = text
+        entry.annotation.emoji_tag = emoji_tag(entry.annotation.emoji)
+        entry.title = title
+        entry.text = text
+        return true
+    end
+    local marker = self:_resolveIndexedPdfMarker(entry)
+    if not marker then return false, _("The PDF annotation could not be found.") end
+    local pending
+    for _, candidate in ipairs(self.pending_annotations or {}) do
+        if candidate.kind == "edit" and candidate.key == marker.key then
+            pending = candidate
+            break
+        end
+    end
+    local created = not pending
+    if not pending then
+        pending = { kind = "edit", key = marker.key }
+        self.pending_annotations[#self.pending_annotations + 1] = pending
+    end
+    local old_text, old_emoji, old_size = pending.text, pending.emoji, pending.emoji_size
+    pending.text = block
+    pending.emoji = pending.emoji or marker.emoji
+    pending.emoji_size = pending.emoji_size or marker.emoji_size
+    entry.text = pending.text
+    entry.emoji = pending.emoji
+    if not self:_savePositions() then
+        if created then
+            table.remove(self.pending_annotations)
+        else
+            pending.text, pending.emoji, pending.emoji_size = old_text, old_emoji, old_size
+        end
+        return false, _("Could not save the pending PDF annotation update.")
+    end
+    return true
+end
+
+function MarginPop:_createNotebookAnnotation(text)
+    local position = {
+        x = math.floor(Screen:getWidth() / 2),
+        y = math.floor(Screen:getHeight() / 2),
+    }
+    local anchor = self:_getAnnotationAnchor(position)
+    if not anchor then return false, _("Could not anchor the notebook text at the current reading position.") end
+    local annotation = {
+        id = string.format("marginpop-%d-%d", os.time(), #self.sidecar_annotations + 1),
+        created_at = os.time(),
+        anchor = anchor,
+        text = text,
+        emoji = nil,
+        emoji_size = self.emoji_size,
+        chapter = self:_contextValues({ anchor = anchor }).chapter,
+    }
+    self.sidecar_annotations[#self.sidecar_annotations + 1] = annotation
+    return true
+end
+
+function MarginPop:_scheduleNotebookSync()
+    if self.notebook_sync_scheduled or not (self.ui and self.ui.document) then return end
+    self.notebook_sync_scheduled = true
+    local doc = self.ui.document
+    UIManager:scheduleIn(0.4, function()
+        self.notebook_sync_scheduled = false
+        if self.ui and self.ui.document == doc and not self.notebook_sync_suppressed then
+            self:_syncNotebook(false)
+        end
+    end)
+end
+
+function MarginPop:_syncNotebook(force_all_pdf, append_missing)
+    local path = self:_notebookPath()
+    if not path then
+        local err = _("The book has no notebook path.")
+        self:_notice(err)
+        return false, err
+    end
+    if force_all_pdf then
+        local entries, complete = self:_notebookEntries(true, append_missing)
+        if not complete then return true end
+        if entries == nil then return false end
+    end
+    local contents, read_error = self:_readNotebook(path)
+    if contents == nil then
+        self:_notice(_("Could not read the book notebook: ") .. tostring(read_error))
+        return false, read_error
+    end
+    local blocks = split_notebook_blocks(contents)
+    local entries, index_complete = self:_notebookEntries(false)
+    if not index_complete and force_all_pdf then return true end
+    local state = self.notebook_sync_state or { records = {}, unlinked = {} }
+    local records = state.records or {}
+    if not state.initialized then
+        records = {}
+        for _, block in ipairs(blocks) do
+            records[#records + 1] = { block = block }
+        end
+    end
+    local matches, used_blocks = {}, {}
+    local next_block = 1
+    for record_index, record in ipairs(records) do
+        local found
+        for block_index = next_block, #blocks do
+            if blocks[block_index] == record.block then
+                found = block_index
+                break
+            end
+        end
+        if found then
+            matches[record_index] = found
+            used_blocks[found] = true
+            next_block = found + 1
+        end
+    end
+    local previous_record, previous_block = 0, 0
+    for record_index = 1, #records + 1 do
+        local block_index = matches[record_index]
+        if record_index == #records + 1 or block_index then
+            local record_end = record_index - 1
+            local block_end = block_index and block_index - 1 or #blocks
+            local missing_records = record_end - previous_record
+            local missing_blocks = block_end - previous_block
+            local paired = math.min(missing_records, missing_blocks)
+            for offset = 1, paired do
+                local ri = previous_record + offset
+                local bi = previous_block + offset
+                matches[ri] = bi
+                used_blocks[bi] = true
+            end
+            if block_index then
+                previous_record, previous_block = record_index, block_index
+            end
+        end
+    end
+
+    local active_ids = {}
+    for _, entry in ipairs(entries) do active_ids[entry.id] = true end
+    local output_blocks, output_records = {}, {}
+    local record_for_id = {}
+    local sync_changed_annotations = false
+    local unlinked = {}
+    for id, value in pairs(state.unlinked or {}) do
+        if value == true then unlinked[id] = true end
+    end
+    for record_index, record in ipairs(records) do
+        local block_index = matches[record_index]
+        local id = record.id
+        if block_index then
+            local block = blocks[block_index]
+            local snapshot_block = block
+            local entry = id and self:_notebookItemById(entries, id)
+            if id and id:match("^pdf:") and not entry and not index_complete then
+                snapshot_block = record.block
+            end
+            if id and not unlinked[id] and entry and block ~= record.block then
+                local updated, update_error = self:_updateNotebookEntry(
+                    entry, block, record.has_title == true, record.page_context)
+                if not updated then
+                    self:_notice(_("Could not sync notebook text: ") .. tostring(update_error))
+                    return false, update_error
+                end
+                sync_changed_annotations = true
+            end
+            if id and active_ids[id] and not unlinked[id] then
+                entry = self:_notebookItemById(entries, id)
+                block = entry and self:_notebookBlock(entry) or block
+                snapshot_block = block
+                record_for_id[id] = true
+            end
+            output_blocks[#output_blocks + 1] = block
+            output_records[#output_records + 1] = {
+                id = id, block = snapshot_block, has_title = record.has_title == true,
+                page_context = entry and entry.page_context or record.page_context,
+            }
+        elseif id and active_ids[id] and not unlinked[id] and not append_missing then
+            unlinked[id] = true
+        end
+    end
+
+    local new_text_blocks = {}
+    for block_index, block in ipairs(blocks) do
+        if not used_blocks[block_index] then
+            new_text_blocks[#new_text_blocks + 1] = block
+        end
+    end
+    for _, block in ipairs(new_text_blocks) do
+        local target = self:_nearestNotebookEntry(entries)
+        local ok, append_error
+        if target then
+            ok, append_error = self:_appendNotebookText(target, block)
+            if ok then sync_changed_annotations = true end
+        else
+            ok, append_error = self:_createNotebookAnnotation(block)
+            if ok then sync_changed_annotations = true end
+        end
+        if not ok then
+            self:_notice(_("Could not attach notebook text to an annotation: ")
+                .. tostring(append_error))
+            output_blocks[#output_blocks + 1] = block
+            output_records[#output_records + 1] = { block = block }
+        else
+            local created = target or entries[#entries]
+            if not target then
+                entries = self:_notebookEntries(false)
+                created = entries[#entries]
+            end
+            if created then
+                local updated_block = self:_notebookBlock(created)
+                local found_record = false
+                for index, record in ipairs(output_records) do
+                    if record.id == created.id then
+                        output_blocks[index] = updated_block
+                        record.block = updated_block
+                        found_record = true
+                    end
+                end
+                if not found_record then
+                    output_blocks[#output_blocks + 1] = updated_block
+                    output_records[#output_records + 1] = {
+                        id = created.id, block = updated_block,
+                        has_title = created.title ~= nil,
+                        page_context = created.page_context,
+                    }
+                end
+                record_for_id[created.id] = true
+            end
+        end
+    end
+
+    for _, entry in ipairs(entries) do
+        if not record_for_id[entry.id] and not unlinked[entry.id] then
+            local block = self:_notebookBlock(entry)
+            if block ~= "" then
+                output_blocks[#output_blocks + 1] = block
+                output_records[#output_records + 1] = {
+                    id = entry.id, block = block, has_title = entry.title ~= nil,
+                    page_context = entry.page_context,
+                }
+            end
+        end
+    end
+
+    local previous_sync_state = self.notebook_sync_state
+    self.notebook_sync_state = {
+        records = output_records,
+        unlinked = unlinked,
+        initialized = true,
+    }
+    self.notebook_sync_suppressed = true
+    local sidecar_saved = self:_saveSidecarAnnotations()
+    self.notebook_sync_suppressed = false
+    if not sidecar_saved then
+        self.notebook_sync_state = previous_sync_state
+        self:_notice(_("Could not save notebook synchronization data in the book sidecar."))
+        return false
+    end
+    local output = join_notebook_blocks(output_blocks)
+    if output ~= contents:gsub("\r\n", "\n"):gsub("\r", "\n") then
+        local written, write_error = self:_writeNotebook(path, output)
+        if not written then
+            self.notebook_sync_state = previous_sync_state
+            self.notebook_sync_suppressed = true
+            local restored = self:_saveSidecarAnnotations()
+            self.notebook_sync_suppressed = false
+            if not restored then
+                logger.warn("MarginPop could not restore notebook sync metadata after write failure")
+            end
+            self:_notice(_("Could not write the book notebook: ") .. tostring(write_error))
+            return false, write_error
+        end
+    end
+    if sync_changed_annotations then
+        self:_setDirty("ui")
+    end
+    return true
+end
+
+function MarginPop:_appendMissingNotebookAnnotations(force_all_pdf)
+    local previous = self.notebook_sync_state
+    self.notebook_sync_state = {
+        records = previous and previous.records or {},
+        unlinked = {},
+        initialized = previous and previous.initialized == true or false,
+    }
+    local synced, err = self:_syncNotebook(force_all_pdf, true)
+    if not synced then
+        self.notebook_sync_state = previous
+        self:_notice(_("Could not append annotations to the book notebook: ") .. tostring(err))
+    end
+    return synced
+end
+
+function MarginPop:_showNotebookOrphans()
+    local synced, sync_error = self:_syncNotebook(false)
+    if not synced then
+        logger.warn("MarginPop could not sync before listing notebook orphans:", sync_error)
+        return true
+    end
+    local entries, complete = self:_notebookEntries(false)
+    if not complete then
+        self.notebook_orphan_list_after_index = true
+        self:_startPdfMarkerIndexBuild()
+        self:_notice(_("Indexing PDF annotations before listing notebook orphans."))
+        return true
+    end
+    local active = {}
+    for _, entry in ipairs(entries) do active[entry.id] = true end
+    local orphan_blocks = {}
+    for _, record in ipairs((self.notebook_sync_state or {}).records or {}) do
+        if record.id and not active[record.id] then
+            orphan_blocks[#orphan_blocks + 1] = record.block
+        end
+    end
+    if #orphan_blocks == 0 then
+        self:_notice(_("There are no orphaned notebook blocks."))
+    else
+        local shown = {}
+        for index = 1, math.min(#orphan_blocks, 40) do
+            shown[#shown + 1] = orphan_blocks[index]
+        end
+        if #orphan_blocks > #shown then
+            shown[#shown + 1] = _("…and more")
+        end
+        UIManager:show(InfoMessage:new{
+            text = _("Notebook blocks without a matching MarginPop annotation:\n\n")
+                .. table.concat(shown, "\n\n---\n\n"),
+        })
+    end
+    return true
+end
+
+function MarginPop:_clearManagedNotebookBlocks()
+    local synced, sync_error = self:_syncNotebook(false)
+    if not synced then
+        logger.warn("MarginPop could not sync before clearing notebook blocks:", sync_error)
+        return false
+    end
+    local path = self:_notebookPath()
+    local contents, read_error = self:_readNotebook(path)
+    if contents == nil then
+        self:_notice(_("Could not read the book notebook: ") .. tostring(read_error))
+        return false
+    end
+    local blocks = split_notebook_blocks(contents)
+    local managed_counts, unlinked = {}, {}
+    for _, record in ipairs((self.notebook_sync_state or {}).records or {}) do
+        if record.id then
+            managed_counts[record.block] = (managed_counts[record.block] or 0) + 1
+            unlinked[record.id] = true
+        end
+    end
+    local kept_blocks, kept_records = {}, {}
+    for _, block in ipairs(blocks) do
+        local count = managed_counts[block] or 0
+        if count > 0 then
+            managed_counts[block] = count - 1
+        else
+            kept_blocks[#kept_blocks + 1] = block
+            kept_records[#kept_records + 1] = { block = block }
+        end
+    end
+    local written, write_error = self:_writeNotebook(path, join_notebook_blocks(kept_blocks))
+    if not written then
+        self:_notice(_("Could not clear managed notebook blocks: ") .. tostring(write_error))
+        return false
+    end
+    local previous = self.notebook_sync_state
+    self.notebook_sync_state = {
+        records = kept_records, unlinked = unlinked, initialized = true,
+    }
+    self.notebook_sync_suppressed = true
+    local saved = self:_saveSidecarAnnotations()
+    self.notebook_sync_suppressed = false
+    if not saved then
+        self.notebook_sync_state = previous
+        local restored, restore_error = self:_writeNotebook(path, contents)
+        if not restored then
+            logger.warn("MarginPop could not restore the notebook after sidecar save failure:",
+                restore_error)
+        end
+        self:_notice(_("Could not save notebook synchronization data in the book sidecar."))
+        return false
     end
     return true
 end
@@ -1635,9 +2518,7 @@ function MarginPop:_deleteSidecarAnnotation(annotation, index, dialog)
         return false
     end
     self:_setAnnotationMode(false)
-    if dialog then
-        UIManager:close(dialog)
-    end
+    if dialog then UIManager:close(dialog) end
     self:_setDirty("ui")
     return true
 end
@@ -1761,7 +2642,7 @@ function MarginPop:_deleteMarker(marker, dialog)
             table.remove(self.pending_annotations)
         end
         self:_notice(_("Could not save the pending marker deletion; check sidecar storage."))
-        return
+        return false
     end
 
     local doc = self.ui.document
@@ -1773,13 +2654,14 @@ function MarginPop:_deleteMarker(marker, dialog)
     if not ok or result == false then
         self:_notice(_("PDF marker deletion is pending and will be retried on reopen: ")
             .. tostring(result))
-        return
+        return true
     end
     self.marker_cache[marker.page] = nil
     self:_invalidatePdfMarkerIndex()
     self:_setDirty("ui")
     self:_setAddMode(false)
-    UIManager:close(dialog)
+    if dialog then UIManager:close(dialog) end
+    return true
 end
 
 function MarginPop:_promptEditMarker(marker, draft)
@@ -2240,16 +3122,22 @@ function MarginPop:_handleTap(readerlink, ges)
     return false
 end
 
-function MarginPop:_handleAnnotationHold(ges)
+function MarginPop:_handleAnnotationHold(ges, reader_highlight)
     if not (ges and ges.pos) then return false end
     local annotation, index = self:_findSidecarAnnotationAt(ges.pos)
     if annotation then
+        if reader_highlight and reader_highlight.onClose then
+            reader_highlight:onClose()
+        end
         self:_promptSidecarAnnotation(annotation, index)
         return true
     end
 
     local marker = self:_findMarkerAt(ges.pos, false)
     if marker then
+        if reader_highlight and reader_highlight.onClose then
+            reader_highlight:onClose()
+        end
         return self:_editMarker(marker)
     end
     return false
@@ -2309,7 +3197,7 @@ function MarginPop:_installHooks()
                         and ACTIVE[readerhighlight.ui]
                     if instance then
                         local ok_hold, consumed = pcall(
-                            instance._handleAnnotationHold, instance, ges)
+                            instance._handleAnnotationHold, instance, ges, readerhighlight)
                         if ok_hold and consumed then return true end
                     end
                     return original_onHold(readerhighlight, event, ges)
@@ -2339,6 +3227,32 @@ function MarginPop:_installHooks()
             end
 
             rawset(_G, "__marginpop_readerhighlight_hook_v2_2", true)
+        end
+    end
+
+    if not rawget(_G, "__marginpop_selection_default_hook_v1") then
+        local ok, ReaderHighlight = pcall(require, "apps/reader/modules/readerhighlight")
+        if ok and ReaderHighlight and type(ReaderHighlight.onHoldRelease) == "function" then
+            local previous_onHoldRelease = ReaderHighlight.onHoldRelease
+            ReaderHighlight.onHoldRelease = function(readerhighlight, ...)
+                local instance = readerhighlight and readerhighlight.ui
+                    and ACTIVE[readerhighlight.ui]
+                if instance and instance.move_once then
+                    return true
+                end
+                if instance and instance.annotate_selection_by_default
+                    and readerhighlight.selected_text
+                    and not readerhighlight.select_mode then
+                    local ok_add, consumed = pcall(
+                        instance._addAnnotationFromSelection, instance, readerhighlight)
+                    if ok_add and consumed then return true end
+                    if not ok_add then
+                        logger.err("MarginPop could not annotate the selection:", consumed)
+                    end
+                end
+                return previous_onHoldRelease(readerhighlight, ...)
+            end
+            rawset(_G, "__marginpop_selection_default_hook_v1", true)
         end
     end
 
@@ -2959,6 +3873,15 @@ function MarginPop:_promptSidecarAnnotation(annotation, index)
         add_scroll_buttons = true,
         buttons = buttons,
     }
+    local inherited_close_widget = dialog.onCloseWidget
+    function dialog:onCloseWidget(...)
+        self._marginpop_closed = true
+        self.plugin:_setAnnotationMode(false)
+        if inherited_close_widget then
+            return inherited_close_widget(self, ...)
+        end
+    end
+    dialog.plugin = self
     self:_attachInlineEmojiRows(dialog, quick_emoji_rows)
     UIManager:show(dialog)
     dialog:onShowKeyboard()
@@ -3102,7 +4025,7 @@ function MarginPop:_invalidatePdfMarkerIndex()
     self.pdf_marker_index_generation = (self.pdf_marker_index_generation or 0) + 1
 end
 
-function MarginPop:_getPdfMarkerIndex(scan_all)
+function MarginPop:_getPdfMarkerIndex(scan_all, cached_only)
     local doc = self.ui and self.ui.document
     if not (doc and doc.is_pdf and doc.info) then return {}, true end
 
@@ -3126,7 +4049,9 @@ function MarginPop:_getPdfMarkerIndex(scan_all)
             if type(entry) ~= "table" or type(entry.page) ~= "number"
                 or type(entry.key) ~= "string"
                 or (entry.text ~= nil and type(entry.text) ~= "string")
-                or (entry.emoji ~= nil and type(entry.emoji) ~= "string") then
+                or (entry.emoji ~= nil and type(entry.emoji) ~= "string")
+                or (entry.x ~= nil and type(entry.x) ~= "number")
+                or (entry.y ~= nil and type(entry.y) ~= "number") then
                 valid = false
                 break
             end
@@ -3139,6 +4064,7 @@ function MarginPop:_getPdfMarkerIndex(scan_all)
     end
 
     if not scan_all then
+        if cached_only then return {}, false end
         local entries = {}
         for _, page in ipairs(self:_getMarkerPagesForView()) do
             for _, marker in ipairs(self:_getPageMarkers(page)) do
@@ -3148,6 +4074,8 @@ function MarginPop:_getPdfMarkerIndex(scan_all)
                     text = marker.text or "",
                     emoji = marker.emoji,
                     version = marker.version,
+                    x = marker.embedded_x,
+                    y = marker.embedded_y,
                 }
             end
         end
@@ -3163,6 +4091,8 @@ function MarginPop:_getPdfMarkerIndex(scan_all)
                 text = marker.text or "",
                 emoji = marker.emoji,
                 version = marker.version,
+                x = marker.embedded_x,
+                y = marker.embedded_y,
             }
         end
         self.marker_cache[page] = nil
@@ -3191,7 +4121,7 @@ function MarginPop:_startPdfMarkerIndexBuild()
     if not (doc and doc.is_pdf and doc.info) or self.pdf_marker_index_building then
         return false
     end
-    local _, complete = self:_getPdfMarkerIndex(false)
+    local _, complete = self:_getPdfMarkerIndex(false, true)
     if complete then return false end
 
     self.pdf_marker_index_building = true
@@ -3236,9 +4166,32 @@ function MarginPop:_startPdfMarkerIndexBuild()
                     end
                 end
             end
-            self:_notice(_("PDF annotation indexing is complete. Reopen the list for all pages."))
+            local refreshed_list = self:_refreshAnnotationResultsAfterPdfIndex()
+            self:_notice(refreshed_list
+                and _("PDF annotation indexing is complete; the list was refreshed.")
+                or _("PDF annotation indexing is complete. Reopen the list to see all pages."))
+            if self.notebook_sync_after_index then
+                local notebook_options = self.notebook_sync_after_index
+                self.notebook_sync_after_index = nil
+                UIManager:scheduleIn(0.1, function()
+                    if self.ui and self.ui.document == doc then
+                        self:_syncNotebook(true, notebook_options.append_missing)
+                    end
+                end)
+            end
+            if self.notebook_orphan_list_after_index then
+                self.notebook_orphan_list_after_index = false
+                UIManager:scheduleIn(0.1, function()
+                    if self.ui and self.ui.document == doc then
+                        self:_showNotebookOrphans()
+                    end
+                end)
+            end
         else
+            self.notebook_sync_after_index = nil
+            self.notebook_orphan_list_after_index = false
             logger.warn("MarginPop could not index", failed_pages, "PDF page(s)")
+            self:_refreshAnnotationResultsAfterPdfIndex()
             self:_notice(_("PDF annotation indexing finished with unreadable pages."))
         end
     end
@@ -3259,6 +4212,8 @@ function MarginPop:_startPdfMarkerIndexBuild()
                         text = marker.text or "",
                         emoji = marker.emoji,
                         version = marker.version,
+                        x = marker.embedded_x,
+                        y = marker.embedded_y,
                     }
                 end
             else
@@ -3319,7 +4274,7 @@ function MarginPop:_collectAnnotationSearchResults(query, emoji_filter)
     local marker_index_complete = true
     if doc and doc.is_pdf then
         local marker_index
-        marker_index, marker_index_complete = self:_getPdfMarkerIndex(false)
+        marker_index, marker_index_complete = self:_getPdfMarkerIndex(false, true)
         for _, marker in ipairs(marker_index) do
             if type(marker) == "table" and type(marker.key) == "string"
                 and matches(marker) then
@@ -3846,9 +4801,33 @@ function MarginPop:_openAnnotationSearchEntry(entry, dialog)
     self:_promptSidecarAnnotation(annotation, entry.index)
 end
 
-function MarginPop:_showAnnotationResults(query, emoji_filter, results, selected_keys)
+function MarginPop:_refreshAnnotationResultsAfterPdfIndex()
+    local dialog = self.annotation_results_dialog
+    local state = dialog and dialog._marginpop_pdf_index_refresh_state
+    if not state then return false end
+
+    UIManager:close(dialog)
+    local ok, results = pcall(
+        self._collectAnnotationSearchResults, self, state.query, state.emoji_filter)
+    if not ok then
+        logger.err("MarginPop could not refresh the PDF annotation list:", results)
+        self:_notice(_("Could not refresh the annotation list. Check the KOReader log."))
+        return true
+    end
+    self:_showAnnotationResults(
+        state.query, state.emoji_filter, results, state.selected_keys, state.page)
+    return true
+end
+
+function MarginPop:_showAnnotationResults(
+    query, emoji_filter, results, selected_keys, page, refresh_when_indexed)
     selected_keys = selected_keys or {}
     results = type(results) == "table" and results or {}
+    local page_count = math.max(1,
+        math.ceil(#results / ANNOTATION_RESULTS_PAGE_SIZE))
+    page = clamp(math.floor(tonumber(page) or 1), 1, page_count)
+    local first_result = (page - 1) * ANNOTATION_RESULTS_PAGE_SIZE + 1
+    local last_result = math.min(page * ANNOTATION_RESULTS_PAGE_SIZE, #results)
     local results_dialog
     local selected_count = 0
     for _, entry in ipairs(results) do
@@ -3858,7 +4837,8 @@ function MarginPop:_showAnnotationResults(query, emoji_filter, results, selected
     end
 
     local rows = {}
-    for _, entry in ipairs(results) do
+    for index = first_result, last_result do
+        local entry = results[index]
         local item = entry.annotation or entry.marker
         local key = annotation_entry_key(entry)
         local prefix = selected_keys[key] and "[x] " or "[ ] "
@@ -3882,11 +4862,12 @@ function MarginPop:_showAnnotationResults(query, emoji_filter, results, selected
                 end
                 UIManager:close(results_dialog)
                 self:_showAnnotationResults(
-                    query, emoji_filter, results, selected_keys)
+                    query, emoji_filter, results, selected_keys, page,
+                    refresh_when_indexed)
             end,
             hold_callback = function()
                 if not result_item.emoji then return end
-                local filtered = self:_collectAnnotationSearchResults(
+                local filtered, index_complete = self:_collectAnnotationSearchResults(
                     query, result_item.emoji)
                 if #filtered == 0 then
                     self:_notice(_("No matching annotations."))
@@ -3894,11 +4875,34 @@ function MarginPop:_showAnnotationResults(query, emoji_filter, results, selected
                 end
                 UIManager:close(results_dialog)
                 self:_showAnnotationResults(
-                    query, result_item.emoji, filtered, selected_keys)
+                    query, result_item.emoji, filtered, selected_keys, 1,
+                    not index_complete)
             end,
         }}
     end
-
+    if page_count > 1 then
+        rows[#rows + 1] = {
+            { text = _("Previous page"), enabled = page > 1, callback = function()
+                UIManager:close(results_dialog)
+                self:_showAnnotationResults(
+                    query, emoji_filter, results, selected_keys, page - 1,
+                    refresh_when_indexed)
+            end },
+            { text = string.format(_("%d / %d"), page, page_count), enabled = false },
+            { text = _("Next page"), enabled = page < page_count, callback = function()
+                UIManager:close(results_dialog)
+                self:_showAnnotationResults(
+                    query, emoji_filter, results, selected_keys, page + 1,
+                    refresh_when_indexed)
+            end },
+        }
+    end
+    if refresh_when_indexed then
+        rows[#rows + 1] = {
+            { text = _("Indexing PDF annotations; this list will update when ready."),
+                enabled = false },
+        }
+    end
     rows[#rows + 1] = {
         { text = _("Edit selected"), callback = function()
             local selected
@@ -3915,6 +4919,46 @@ function MarginPop:_showAnnotationResults(query, emoji_filter, results, selected
                 self:_openAnnotationSearchEntry(selected, results_dialog)
             else
                 self:_notice(_("Select an annotation first."))
+            end
+        end },
+        { text = _("Delete selected"), enabled = selected_count > 0, callback = function()
+            local retained = {}
+            local deleted = 0
+            for _, entry in ipairs(results) do
+                local key = annotation_entry_key(entry)
+                if selected_keys[key] then
+                    local ok
+                    if entry.annotation then
+                        ok = self:_deleteSidecarAnnotation(
+                            entry.annotation, entry.index)
+                    elseif entry.marker then
+                        local marker = entry.marker.native_boxes and entry.marker
+                            or self:_resolveIndexedPdfMarker(entry)
+                        if marker then
+                            ok = self:_deleteMarker(marker)
+                        else
+                            self:_notice(_("A selected PDF annotation is no longer available."))
+                        end
+                    end
+                    if ok then
+                        selected_keys[key] = nil
+                        deleted = deleted + 1
+                    else
+                        retained[#retained + 1] = entry
+                    end
+                else
+                    retained[#retained + 1] = entry
+                end
+            end
+            if deleted > 0 then
+                UIManager:close(results_dialog)
+                if #retained > 0 then
+                    self:_showAnnotationResults(
+                        query, emoji_filter, retained, selected_keys, page,
+                        refresh_when_indexed)
+                else
+                    self:_notice(_("Selected annotations deleted."))
+                end
             end
         end },
         { text = _("Export selected"), callback = function()
@@ -3940,7 +4984,9 @@ function MarginPop:_showAnnotationResults(query, emoji_filter, results, selected
                     selected_keys[annotation_entry_key(entry)] = select_all or nil
                 end
                 UIManager:close(results_dialog)
-                self:_showAnnotationResults(query, emoji_filter, results, selected_keys)
+                self:_showAnnotationResults(
+                    query, emoji_filter, results, selected_keys, page,
+                    refresh_when_indexed)
             end },
         { text = _("Search / filter"), callback = function()
             UIManager:close(results_dialog)
@@ -3957,6 +5003,25 @@ function MarginPop:_showAnnotationResults(query, emoji_filter, results, selected
         width_factor = 0.98,
         buttons = rows,
     }
+    results_dialog.plugin = self
+    if refresh_when_indexed then
+        results_dialog._marginpop_pdf_index_refresh_state = {
+            query = query,
+            emoji_filter = emoji_filter,
+            selected_keys = selected_keys,
+            page = page,
+        }
+    end
+    local inherited_close_widget = results_dialog.onCloseWidget
+    function results_dialog:onCloseWidget(...)
+        if self.plugin.annotation_results_dialog == self then
+            self.plugin.annotation_results_dialog = nil
+        end
+        if inherited_close_widget then
+            return inherited_close_widget(self, ...)
+        end
+    end
+    self.annotation_results_dialog = results_dialog
     UIManager:show(results_dialog)
     return results_dialog
 end
@@ -3975,13 +5040,13 @@ function MarginPop:_showSidecarAnnotationSearch(initial_query, emoji_filter, sel
         if not index_complete then
             self:_startPdfMarkerIndexBuild()
         end
-        if #results == 0 then
-            self:_notice(index_complete and _("No matching annotations.")
-                or _("No match on visible pages. PDF indexing is running; retry when it finishes."))
+        if #results == 0 and index_complete then
+            self:_notice(_("No matching annotations."))
             return
         end
         UIManager:close(dialog)
-        self:_showAnnotationResults(query, emoji_filter, results, selected_keys)
+        self:_showAnnotationResults(
+            query, emoji_filter, results, selected_keys, 1, not index_complete)
     end
     dialog = InputDialog:new{
         title = _("Search annotations"),
@@ -4768,7 +5833,8 @@ function MarginPop:_setAnnotationMode(enabled)
         self.move_selected_annotation = nil
         self.move_once = false
     end
-    self:_setDirty("ui")
+    local doc = self.ui and self.ui.document
+    self:_setDirty(not enabled and doc and not doc.is_pdf and "full" or "ui")
     if entering then
         UIManager:show(Notification:new{
             text = _("Annotation mode: tap a location to add a note."),
@@ -4791,7 +5857,8 @@ function MarginPop:_setAddMode(enabled)
         self.move_selected_annotation = nil
         self.move_once = false
     end
-    self:_setDirty("ui")
+    local doc = self.ui and self.ui.document
+    self:_setDirty(not enabled and doc and not doc.is_pdf and "full" or "ui")
     if entering then
         UIManager:show(Notification:new{
             text = _("Annotation mode: tap anywhere to add a note."),
@@ -4842,18 +5909,6 @@ function MarginPop:_togglePdfNoteEmbedding()
         or _("Automatic PDF note embedding is off for this book."))
 end
 
-function MarginPop:_setPdfReflowAnchorMode(mode)
-    if mode ~= "nearest" and mode ~= "line_right" then return end
-    local previous = self.pdf_reflow_anchor_mode
-    self.pdf_reflow_anchor_mode = mode
-    if not self:_saveSidecarAnnotations() then
-        self.pdf_reflow_anchor_mode = previous
-        self:_notice(_("Could not save the PDF anchor preference."))
-        return
-    end
-    self:_setDirty("ui")
-end
-
 function MarginPop:_setEmojiSize(size)
     size = tonumber(size)
     if not size or size < 2 or size > 64 then return false end
@@ -4869,59 +5924,8 @@ function MarginPop:_setEmojiSize(size)
     return true
 end
 
-function MarginPop:_resetMarker(marker)
-    if not marker or marker.version ~= 2 then return false end
-
-    local has_pending = self.positions[marker.key] ~= nil
-    local has_embedded = marker.embedded_x ~= nil and marker.embedded_y ~= nil
-    local already_reset = self.dirty_positions[marker.key] == "reset"
-    if not has_pending and not has_embedded and not already_reset then
-        return false
-    end
-
-    self.positions[marker.key] = nil
-    self.dirty_positions[marker.key] = "reset"
-    return true
-end
-
-function MarginPop:_resetVisiblePositions()
-    local changed = false
-    for _, page in ipairs(self:_getVisiblePages()) do
-        for _, marker in ipairs(self:_getPageMarkers(page)) do
-            if self:_resetMarker(marker) then
-                changed = true
-            end
-        end
-    end
-
-    self.move_selected = nil
-    if changed then
-        self:_savePositions()
-        self:_setDirty("ui")
-    end
-end
-
-function MarginPop:_resetAllPositions()
-    local doc = self.ui and self.ui.document
-    local page_count = doc and doc.info and doc.info.number_of_pages or 0
-    local changed = false
-
-    for page = 1, page_count do
-        for _, marker in ipairs(self:_getPageMarkers(page)) do
-            if self:_resetMarker(marker) then
-                changed = true
-            end
-        end
-    end
-
-    self.move_selected = nil
-    if changed then
-        self:_savePositions()
-        self:_setDirty("ui")
-    end
-end
-
 function MarginPop:addToMainMenu(menu_items)
+    local is_pdf = self.ui and self.ui.document and self.ui.document.is_pdf
     local history_export_items = {
         {
             text = _("History Export Fields"),
@@ -4940,98 +5944,75 @@ function MarginPop:addToMainMenu(menu_items)
             callback = function() self:_exportAllHistoryAnnotations("annotation") end,
         },
     }
-    local pdf_options = {
+    local annotation_items = {
         {
-            text = _("PDF Reflow Anchor Placement"),
-            sub_item_table = {
-                {
-                    text = _("Nearest Text Item"),
-                    checked_func = function()
-                        return self.pdf_reflow_anchor_mode == "nearest"
-                    end,
-                    callback = function() self:_setPdfReflowAnchorMode("nearest") end,
-                },
-                {
-                    text = _("Right Margin of Nearest Text Item"),
-                    checked_func = function()
-                        return self.pdf_reflow_anchor_mode == "line_right"
-                    end,
-                    callback = function() self:_setPdfReflowAnchorMode("line_right") end,
-                },
-            },
+            text = _("Annotation Mode"),
+            checked_func = function() return self.annotate_mode end,
+            callback = function() self:_toggleAddMode() end,
         },
         {
-            text = _("Reset visible-page legacy marker positions"),
-            callback = function() self:_resetVisiblePositions() end,
+            text = _("Annotation List"),
+            callback = function() self:onMarginPopAnnotationList() end,
         },
         {
-            text = _("Reset all legacy marker positions"),
-            callback = function() self:_resetAllPositions() end,
+            text = _("Search Annotations"),
+            callback = function() self:onMarginPopAnnotationSearch() end,
         },
     }
-    if self.ui and self.ui.document and self.ui.document.is_pdf then
-        table.insert(pdf_options, 1, {
-            text = _("Embed Notes in PDF on Close"),
-            checked_func = function() return self.embed_pdf_notes end,
-            callback = function() self:_togglePdfNoteEmbedding() end,
-        })
-    end
+    local editor_display_items = {
+        {
+            text = _("Fullscreen Annotation Editor"),
+            checked_func = function() return self.annotation_editor_fullscreen end,
+            callback = function() self:_toggleAnnotationEditorFullscreen() end,
+        },
+        {
+            text = _("Annotation Display Controls"),
+            callback = function() self:_showAnnotationDisplayControls() end,
+        },
+    }
     menu_items.marginpop = {
         text = _("MarginPop"),
         sorting_hint = "typeset",
         sub_item_table = {
             {
-                text = _("Annotation Mode"),
-                checked_func = function()
-                    return self.annotate_mode
-                end,
-                callback = function()
-                    self:_toggleAddMode()
-                end,
+                text = _("Annotations"),
+                sub_item_table = annotation_items,
             },
             {
-                text = _("Annotation List"),
-                callback = function()
-                    self:onMarginPopAnnotationList()
-                end,
+                text = _("Book Notebook"),
+                sub_item_table = {
+                    {
+                        text = _("Open and sync book notebook"),
+                        callback = function() self:onMarginPopOpenNotebook() end,
+                    },
+                    {
+                        text = _("Append missing annotations"),
+                        callback = function()
+                            self:_appendMissingNotebookAnnotations(false)
+                        end,
+                    },
+                    {
+                        text = _("Append all PDF annotations"),
+                        callback = function()
+                            self:_appendMissingNotebookAnnotations(true)
+                        end,
+                    },
+                    {
+                        text = _("List orphaned notebook blocks"),
+                        callback = function() self:_showNotebookOrphans() end,
+                    },
+                    {
+                        text = _("Clear synced notebook blocks"),
+                        callback = function() self:_clearManagedNotebookBlocks() end,
+                    },
+                },
             },
             {
-                text = _("Search Annotations"),
-                callback = function()
-                    self:_showSidecarAnnotationSearch("", nil, {})
-                end,
+                text = _("Editor & Display"),
+                sub_item_table = editor_display_items,
             },
             {
-                text = _("Annotate Selected Text by Default"),
-                checked_func = function()
-                    return self.annotate_selection_by_default
-                end,
-                callback = function()
-                    self:_toggleAnnotationSelectionDefault()
-                end,
-            },
-            {
-                text = _("Fullscreen Annotation Editor"),
-                checked_func = function()
-                    return self.annotation_editor_fullscreen
-                end,
-                callback = function()
-                    self:_toggleAnnotationEditorFullscreen()
-                end,
-            },
-            {
-                text = _("Annotation Display Controls"),
-                callback = function()
-                    self:_showAnnotationDisplayControls()
-                end,
-                separator = true,
-            },
-            {
-                text = _("PDF Options"),
-                sub_item_table = pdf_options,
-            },
-            {
-                text = _("Export All History Annotations"),
+                text = _("History Export"),
                 sub_item_table = history_export_items,
             },
             {
@@ -5042,28 +6023,32 @@ function MarginPop:addToMainMenu(menu_items)
                         "Tap an annotation for its quick action bar; long-press opens the editor directly.\n"
                         .. "Use Save & Move in the editor to relocate it.\n\n"
                         .. "• Bind Annotation Mode to a gesture to add notes in PDF, EPUB, and TXT books.\n"
+                        .. "• Book Notebook syncs readable blocks with page context and adds Chapter/Page insertion buttons; long-press configures their global formats.\n"
                         .. "• Select text and use Add annotation to create a note with the quote included.\n"
                         .. "• Reflow PDF, EPUB, and TXT anchors are saved in the book sidecar.\n"
                         .. "• PDF sidecar notes can be embedded as standard comments on close; toggle this per book.\n"
                         .. "• Existing KOPOPZH1/KOPOPZH2 PDF markers remain supported.\n"
                         .. "• Display Controls has compact size/width adjustments, separate PDF reflow emoji placement, and per-mode text visibility.\n"
                         .. "• Search supports text and emoji filters; the editor can insert the book, chapter, and page.\n"
-                        .. "• PDF reflow anchors can use the nearest text item or its right margin. If OCR has no text boxes, placement falls back to the page center.\n\n"
+                        .. "• PDF reflow anchors use nearby text when available and fall back to page-relative placement if OCR has no text boxes.\n\n"
                         .. "If sidecar or PDF saving fails, pending changes are retained and an error is shown."
                     ))
                 end,
             },
         },
     }
-    if not (self.ui and self.ui.document and self.ui.document.is_pdf) then
-        local submenu = menu_items.marginpop.sub_item_table
-        for index, item in ipairs(submenu) do
-            if item.text == _("PDF Options") then
-                table.remove(submenu, index)
-                break
-            end
-        end
+    if is_pdf then
+        table.insert(menu_items.marginpop.sub_item_table, 1, {
+            text = _("Embed Notes in PDF on Close"),
+            checked_func = function() return self.embed_pdf_notes end,
+            callback = function() self:_togglePdfNoteEmbedding() end,
+        })
     end
+    table.insert(menu_items.marginpop.sub_item_table, is_pdf and 2 or 1, {
+        text = _("Annotate Selected Text by Default"),
+        checked_func = function() return self.annotate_selection_by_default end,
+        callback = function() self:_toggleAnnotationSelectionDefault() end,
+    })
 end
 
 return MarginPop

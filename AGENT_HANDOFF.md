@@ -20,8 +20,9 @@ documents.
 - Legacy `KOPOPZH1`/`KOPOPZH2` PDF markers remain readable and editable.
   Existing marker position changes use a sidecar journal and batched PDF
   writeback. Do not use the legacy marker payload for new portable comments.
-- The gesture actions **MarginPop: Add Annotation** and **MarginPop: Annotation
-  List** provide one-shot placement and list/search access.
+- The gesture actions **MarginPop: Add Annotation**, **MarginPop: Annotation
+  List**, and **MarginPop: Search Annotations** provide one-shot placement,
+  direct list access, and direct search access.
 - The annotation UI supports multiline notes, inline emoji quick rows, a
   paged OpenMoji picker, context insertion, and a global fullscreen preference
   that defaults to compact mode. The compact editor input shows at least three
@@ -64,18 +65,20 @@ documents.
   reflow visibility are independently persisted. Margin-note line breaks are
   normalized to spaces, and clipped notes have no ellipsis.
 - The **Annotation List** dispatcher/menu action opens results directly.
-  **Search Annotations** is a separate input flow. Retain the working backup
-  behavior: close the search input and show results directly, without a delayed
-  input-dialog-to-results transition. Keep the cached PDF marker index and
-  background indexing; do not restore the backup's synchronous scan of every
-  PDF page.
+  **Search Annotations** is a separate input flow and has its own dispatcher
+  action for gesture binding. Retain the working backup behavior: close the
+  search input and show results directly, without a delayed input-dialog-to-
+  results transition. Keep the cached PDF marker index and background indexing;
+  do not restore the backup's synchronous scan of every PDF page.
 - Search supports text/title and emoji filtering, multi-selection, and
   Markdown export. The full-screen scrollable result list uses plain text
-  without emoji artwork; emoji filtering is done from the emoji picker, and a
-  result can also be long-pressed to filter by its face. Export metadata
+  without emoji artwork, paginated to 20 results per page; emoji filtering is
+  done from the emoji picker, and a result can also be long-pressed to filter
+  by its face. Export metadata
   includes the readable emoji name, OpenMoji code, tag, and page number
   adjusted by the per-book offset. Book/chapter/page metadata can be globally
-  included or omitted in the export dialog.
+  included or omitted in the export dialog. Selected results can also be
+  deleted in bulk; PDF marker deletion remains journaled for retry on reopen.
 - History export reads MarginPop sidecar annotations for KOReader reading
   history and can split files by book, book/chapter, or annotation. Cached
   legacy PDF marker indexes are included when their document fingerprint
@@ -86,15 +89,15 @@ documents.
   Group exports use `YYMMDD-book` or `YYMMDD-book-chapter` filenames. Per-note
   filenames use the creation timestamp; legacy sidecars recover it from their
   IDs, while untimestamped legacy PDF markers use export time.
-- The two marker-position reset actions restore legacy PDF marker overlays to
-  their original positions (visible pages only, or all pages); they do not
-  affect sidecar annotation anchors.
 - A lightweight index of legacy PDF markers is cached in the book's document
   sidecar so subsequent list/search opens avoid rescanning every PDF page.
-- If that PDF index is missing or stale, search scans only visible pages
-  synchronously and builds the full index in small scheduled batches. Do not
-  reintroduce a full-document scan inside the search/list callback; it can
-  freeze or crash KOReader on large PDFs.
+- If that PDF index is missing or stale, list/search reads cached data only and
+  starts the full scan in small scheduled batches; do not synchronously inspect
+  visible or all PDF pages inside the list/search callback. The direct list
+  shows sidecar and cached results immediately, then refreshes automatically
+  when indexing completes if the result dialog remains open. Keep each result
+  page limited to 20 rows to avoid constructing a large ButtonDialog on PDFs
+  with many markers.
 - When opening results from Search, close the text-entry dialog and show the
   scrollable results directly, following the working backup flow. Keep result
   rows plain text and normalize them with `util.fixUtf8`; do not render emoji
@@ -236,6 +239,41 @@ documents.
 
 ## Current implementation notes
 
+- Book notebook integration uses KOReader's per-book `notebook_file`
+  preference, then the global preference, then `<document path>.txt`. The
+  dispatcher action **MarginPop: Open Book Notebook** opens the native
+  texteditor when available and syncs after it closes. Managed blocks append
+  the annotation's formatted Page context using the global insertion format
+  and per-book offset. The native notebook editor gets Chapter and Page
+  insertion buttons; long-press opens the existing global format editor, and
+  the Page format editor retains its per-book offset control.
+- The generated Page line is tracked in the sidecar's notebook record and
+  stripped from notebook edits even when the user types after it; never import
+  that metadata line as annotation body text.
+- **Embed Notes in PDF on Close** (PDF only) and **Annotate Selected Text by
+  Default** are direct first-level MarginPop menu toggles. The former PDF
+  placement and marker-reset menu controls are no longer exposed.
+- Notebook blocks are plain text separated by `--- MarginPop ---`. Stable
+  annotation IDs and the last-synced block snapshots are stored only in the
+  book sidecar. Preserve unmanaged notebook blocks; deleting a linked notebook
+  block unlinks it without deleting the annotation, while deleting an
+  annotation leaves its notebook block as an orphan. Existing notebook text
+  on first sync is treated as unmanaged; new notes should be separate divider-
+  delimited blocks, so a large pre-existing notebook is not imported wholesale.
+- Sidecar annotation changes and marker journal changes schedule a debounced
+  sync; document close and notebook-editor close also reconcile changes.
+  Notebook text attached to an existing annotation appends to its body; if no
+  annotation exists, it creates one at the current reading position. PDF
+  marker text changes must continue through `pending_annotations` and
+  `_savePositions()` rather than writing to the live PDF.
+- Keep normal notebook opens low-cost: use the cached PDF marker index and
+  visible pages. The explicit **Append all PDF annotations** action may build
+  the full marker index in scheduled batches. Do not scan every PDF page
+  synchronously from a menu callback.
+- **Append missing annotations**, **List orphaned notebook blocks**, and
+  **Clear synced notebook blocks** are exposed in the Book Notebook submenu.
+  Clearing removes only linked managed blocks and preserves free text; appending
+  missing annotations re-links/adds the managed entries.
 - New PDF sidecar annotations can be mirrored as standard PDF highlight
   comments. This is enabled by default per PDF, can be disabled per book, and
   is staged for one write at clean document close. Keep the sidecar journal
@@ -247,6 +285,10 @@ documents.
   insertion formats are global. The fullscreen preference defaults to off.
   Page-number offset remains per book and is applied to insertion and export
   page metadata.
+- **Annotate Selected Text by Default** must intercept
+  `ReaderHighlight:onHoldRelease` after KOReader has populated
+  `selected_text`; `onShowHighlightMenu` alone is insufficient because
+  KOReader's own default highlight action can bypass that menu.
 - Inline emoji rows are attached once via `InputDialog:addWidget`; do not also
   insert them through `_added_widgets` or a custom `init` wrapper, as doing so
   duplicates controls when the dialog is reinitialized.

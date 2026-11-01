@@ -18,8 +18,7 @@ bindings and saved data. The user-facing plugin name is MarginPop.
 - For EPUB/TXT, MarginPop anchors to a nearby text position. Fixed-layout PDF
   notes store their page position; reflowed PDF notes use a native PDF
   position when it can be resolved, or a page-relative fallback when OCR/text
-  positioning is unavailable. PDF placement can be configured to use the
-  nearest text item or its right margin.
+  positioning is unavailable.
 - Use **Add annotation** in the text-selection menu to create a note at the
   selection endpoint, including PDF text-layer selections. The selected quote
   is inserted into the note by default. **Annotate Selected Text by Default**
@@ -82,15 +81,18 @@ bindings and saved data. The user-facing plugin name is MarginPop.
 ## Search and export
 
 Open **Annotation List** from the MarginPop menu or use the dispatcher action
-**MarginPop: Annotation List** to open the results directly. **Search
-Annotations** opens a separate search form for note text with an optional
-emoji filter. The full-screen scrollable list uses plain text rows without emoji
-artwork; use the emoji picker on the search page to filter by a face. PDF
-legacy-marker indexing runs in small background batches rather than blocking
-the reader; the first results include sidecar and visible-page annotations,
-and the list can be reopened after indexing finishes. Results are left-aligned
-and can be selected individually or in bulk. Long-press a result to filter by
-its emoji. Selected results can be edited or exported as Markdown.
+**MarginPop: Annotation List** to open the results directly. Use **Search
+Annotations** in the menu or bind the **MarginPop: Search Annotations**
+dispatcher action to a gesture to open a separate search form for note text
+with an optional emoji filter. The full-screen list uses plain text rows
+without emoji artwork and shows 20 results per page; use the emoji picker on
+the search page to filter by a face. PDF legacy-marker indexing runs in small
+background batches so it does not block the reader. Sidecar annotations and
+any cached PDF markers appear
+immediately; if indexing is needed, the open list refreshes when it finishes
+(reopen it if you closed it before then). Results are left-aligned and can be
+selected individually or in bulk. Long-press a result to filter by its emoji.
+Selected results can be edited, deleted, or exported as Markdown.
 
 Export supports one combined Markdown file or separate files. The path field
 starts at `<KOReader folder>/popupExport`; enter an absolute folder path.
@@ -121,9 +123,10 @@ annotations with comment text. The comment contains an `@KOPOP_EMOJI` code
 when an emoji is selected, a readable hashtag, and the note text. It does not
 use MarginPop's legacy `KOPOPZH2`, `@KOPOP_POS`, or emoji-size payload.
 
-**Embed Notes in PDF on Close** is enabled by default for each PDF and can be
-disabled per book. Changes are journaled in the KOReader book sidecar while
-reading, then batched into one PDF write when the document closes normally.
+**Embed Notes in PDF on Close** appears directly in the MarginPop menu for PDF
+books. It is enabled by default and can be disabled per book. Changes are
+journaled in the KOReader book sidecar while reading, then batched into one PDF
+write when the document closes normally.
 Edits, moves, and deletions are synchronized with the embedded comments. If
 the PDF is read-only or writing fails, the sidecar remains the recoverable
 copy and MarginPop reports the failure. Disabling automatic embedding does
@@ -136,10 +139,55 @@ convert or remove existing legacy PDF markers. Existing `KOPOPZH1` and
 Legacy `KOPOPZH2` marker position changes also use the plugin's sidecar
 journal and batched, clean-close PDF writeback.
 
+## Book notebook
+
+MarginPop synchronizes annotations with KOReader's per-book notebook text
+file. **Open Book Notebook** is available from the MarginPop menu and from the
+dispatcher action **MarginPop: Open Book Notebook**, which can be assigned to
+a gesture. It opens the native text editor when available and reconciles
+changes after the editor closes.
+
+Annotation edits are reflected in the notebook, and text added or edited
+there is attached to the annotation nearest the current reading position. If
+the book has no annotations, notebook text creates one at the current
+position. PDF marker updates are journaled for KOReader's normal PDF writeback.
+The notebook contains readable note blocks separated by `--- MarginPop ---`;
+stable matching IDs stay in the book sidecar and are not shown in the text.
+Each managed annotation block includes its page context using the global Page
+insertion format and the book's page offset. The built-in notebook editor adds
+**Chapter** and **Page** buttons; tapping inserts the current chapter/page at
+the cursor, and long-press opens the same global format editor used by the
+annotation editor. Long-pressing **Page** also provides the per-book offset
+setting. The generated Page line is sync metadata, not annotation body text;
+typing before or after it updates the note without rendering the Page line in
+the book margin.
+Text already present in a notebook before its first MarginPop sync is preserved
+as free text. To add a separate notebook note later, start a new block with the
+`--- MarginPop ---` divider; it will be attached to the nearest annotation (or
+to a new annotation at the current position if none exists).
+
+The **Book Notebook** submenu also provides **Append missing annotations**,
+**Append all PDF annotations**, **List orphaned notebook blocks**, and
+**Clear synced notebook blocks**. PDF-wide indexing runs in small background
+batches only when explicitly requested; opening the notebook uses the cached
+index and visible PDF pages to keep resource use low. Removing a synced block
+from the notebook unlinks it without deleting its annotation. Deleting an
+annotation leaves its notebook block as an orphan. Clearing synced blocks
+preserves free notebook text and annotations; use **Append missing
+annotations** to add linked blocks again.
+
+The MarginPop menu keeps **Embed Notes in PDF on Close** (for PDFs) and
+**Annotate Selected Text by Default** directly at the first level. Annotation
+list/search and creation controls are under **Annotations**, editor size and
+display options under **Editor & Display**, and notebook and history-export
+controls in their own submenus.
+
 ## Storage and compatibility
 
 - EPUB/TXT annotations, PDF sidecar anchors, emoji history/favorites, and
   per-book page offsets are stored in KOReader's document sidecar.
+- Notebook reconciliation records and unlink state are stored in that same
+  per-book sidecar; notebook text itself remains a plain text file.
 - PDF sidecar annotations retain their anchor and PDF-export snapshot in that
   sidecar so edits and deletes can be reconciled with the native PDF comment.
 - The searchable index of legacy PDF markers is cached in the book sidecar,
